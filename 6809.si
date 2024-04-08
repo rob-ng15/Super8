@@ -1,0 +1,55 @@
+unit CPU6309(
+    output  uint16  out_address,
+    output  uint32  out_data,
+    input   uint40  in_data,
+
+    output  uint1   req_write,
+    output  uint2   req_mask,
+
+    output  uint1   req_read,
+    output  uint1   req_write,
+    input   uint1   mem_busy,
+
+    input   uint1   RUN,
+    input   uint1   RESET
+) <reginputs> {
+
+    uint16  PC = uninitialised;                                                                                                 // PROGRAM COUNTER
+    uint16  SP[2] = uninitialised;                                                                                              // STACK POINTERS user, system
+
+    uint8   RA[4] = { 0, 0, 0, 0 };                                                                                             // 8 BIT ACCUMULATORS { F E B A } 16 BIT { W D } 32 BIT { Q }
+    uint16  RI[4] = { 0, 0, 0, pad(uninitialised) };                                                                            // 16 BIT INDEX REGISTERS { V, 0, Y X };
+    uint8   DP = uninitialised;                                                                                                 // 8 BIT DIRECT PAGE REGISTER
+    uint8   CC[2] = { 0, 0 };                                                                                                   // CC REGISTERS { E, F, H, I, N, Z, V C } { /0 IE - - - - FM EM }
+
+    req_read := 0; req_write := 0;
+
+    algorithm <autorun> {
+        out_address = 16hFFFE; req_read = 1; while( mem_busy ) {} PC = in_data;                                                 // FETCH RESET PC ADDRESS
+
+        while(1) {
+            while( RUN ) {
+                out_address = PC; req_read = 1; while( mem_busy ) {}
+
+                switch( in_data[0,8] ) {
+                    default: {
+                    }
+                }
+            }
+
+            if( RESET ) { out_address = 16hFFFE; req_read = 1; while( mem_busy ) {} PC = in_data; }                             // FETCH RESET PC ADDRESS
+        }
+    }
+}
+
+// CONVERT 6309 OPCODES INTO MICROCODES + ADDRESS MODE + ACTION FLAGS, CALCULATE BASE EFFECTIVE ADDRESS ( INDIRECT WILL REQUIRE A READ FROM THIS EA )
+unit microcode_6309(
+) <reginputs> {
+    // ADDRESS MODES
+    //  00
+    //  01  IMMEDIATE   #
+    //  02  DIRECT      { DP, single byte index }
+    //  03  INDEXED     address containexd in X Y U S
+    //  04  EXTENDED    address specified
+    //  05  INHERENT    no operand
+}

@@ -1,0 +1,2 @@
+ca65 --cpu 65c02 -l MOS.list -o MOS.o MOS_beebeater.s
+ld65 -C MOS.cfg -o MOS.bin MOS.o

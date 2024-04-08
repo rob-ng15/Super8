@@ -1,0 +1,194 @@
+$$if ICARUS or VERILATOR then
+// PLL for simulation
+unit pll(
+  output  uint1 video_clock,
+  output! uint1 sdram_clock,
+  output! uint1 clock_decode,
+  output  uint1 compute_clock
+) {
+  uint3 counter = 0;
+  uint8 trigger = 8b11111111;
+  sdram_clock   := clock;
+  clock_decode   := clock;
+  compute_clock := ~counter[0,1]; // x2 slower
+  video_clock   := counter[1,1]; // x4 slower
+  always {
+        counter = counter + 1;
+        trigger = trigger >> 1;
+  }
+}
+$$end
+
+unit main(
+    // LEDS (8 of)
+    output  uint8   leds,
+//$$if not SIMULATION then
+    input   uint8   btns,
+
+    // UART
+    output  uint1   uart_tx,
+    input   uint1   uart_rx,
+
+    // GPIO
+    input   uint28  gn,
+    output  uint28  gp,
+
+    // USB PS/2
+    input   uint1   us2_bd_dp,
+    input   uint1   us2_bd_dn,
+
+    // AUDIO
+    output  uint4   audio_l,
+    output  uint4   audio_r,
+
+    // SDCARD
+    output  uint1   sd_clk,
+    output  uint1   sd_mosi,
+    output  uint1   sd_csn,
+    input   uint1   sd_miso,
+//$$end
+
+$$if HDMI then
+    // HDMI OUTPUT
+    output! uint4   gpdi_dp,
+$$end
+$$if VGA then
+    // VGA OUTPUT
+    output! uint$color_depth$ video_r,
+    output! uint$color_depth$ video_g,
+    output! uint$color_depth$ video_b,
+    output  uint1 video_hs,
+    output  uint1 video_vs,
+$$end
+$$if VERILATOR then
+    output  uint1 video_clock,
+$$end
+    // SDRAM
+    output! uint1  sdram_cle,
+    output! uint2  sdram_dqm,
+    output! uint1  sdram_cs,
+    output! uint1  sdram_we,
+    output! uint1  sdram_cas,
+    output! uint1  sdram_ras,
+    output! uint2  sdram_ba,
+    output! uint13 sdram_a,
+$$if VERILATOR then
+    output! uint1  sdram_clock, // sdram controller clock
+    input   uint16 sdram_dq_i,
+    output! uint16 sdram_dq_o,
+    output! uint1  sdram_dq_en,
+$$else
+    output uint1  sdram_clk,  // sdram chip clock != internal sdram_clock
+    inout  uint16 sdram_dq,
+$$end
+    inout   uint1   gpdi_sda,   // i2c for rtc
+    inout   uint1   gpdi_scl
+) <@clock_system,reginputs> {
+
+    uint1   clock_system = uninitialized;
+$$if VERILATOR then
+    $$clock_25mhz = 'video_clock'
+    // --- PLL
+    pll clockgen<@clock,!reset>(
+      video_clock   :> video_clock,
+      sdram_clock   :> sdram_clock,
+      compute_clock :> clock_system,
+    );
+$$else
+    $$clock_25mhz = 'clock'
+    // CLOCK/RESET GENERATION
+    // CPU + MEMORY
+    uint1   sdram_clock = uninitialized;
+    uint1   video_clock = uninitialized;
+    uint1   pll_lock_SYSTEM = uninitialized;
+    ulx3s_clk_SYSTEM8 clk_gen_SYSTEM (
+        clkin    <: $clock_25mhz$,
+        clkSYSTEM  :> clock_system,
+        clkSDRAM :> sdram_clock,
+        clkSDRAMcontrol :> sdram_clk,
+        locked   :> pll_lock_SYSTEM
+    );
+$$end
+
+    // Video Reset
+    uint1   RESET_VIDEO = uninitialised; clean_reset video_rstcond<@$clock_25mhz$,!reset> ( out :> RESET_VIDEO );
+
+    // HDMI/VGA driver
+    uint1   vblank = uninitialised;
+    uint1   pix_active = uninitialised;
+    uint10  pix_x  = uninitialised;
+    uint9   pix_y  = uninitialised;
+    $$if VGA then
+        vga vga_driver<@$clock_25mhz$,!RESET_VIDEO>(
+        vga_hs :> video_hs,
+        vga_vs :> video_vs,
+        vga_x  :> pix_x,
+        vga_y  :> pix_y,
+        vblank :> vblank,
+        active :> pix_active
+    );
+    $$end
+    $$if HDMI then
+    hdmi video <@$clock_25mhz$,!RESET_VIDEO> (
+        vblank  :> vblank,
+        active  :> pix_active,
+        x       :> pix_x,
+        y       :> pix_y,
+        gpdi_dp :> gpdi_dp,
+        red <: DISPLAY.pix_red,
+        green <: DISPLAY.pix_green,
+        blue <: DISPLAY.pix_blue
+    );
+    $$end
+
+    uint9   X <: ( pix_x < 64 ) | vblank | ~pix_active ? 0 : ( pix_x - 64 ) >> 1;                                                  // X coordinate in 0-255 range
+    uint9   Xp1 <: ( pix_x < 63 ) | vblank | ~pix_active ? 0 : ( pix_x - 63 ) >> 1;                                                // X coordinate in 0-255 range ( 1 in advance)
+    uint8   Y <: ( pix_y < 48 ) | vblank | ~pix_active ? 0 : pix_y[1,8] - 24;                                                      // Y coordinate in 0-192 range
+    uint1   V <: ( ~vblank | pix_active ) & ( ( pix_x > 63 ) & ( pix_x < 575 ) ) & ( ( pix_y > 47 ) & ( pix_y < 432 ) );           // V 256x192 display is in range
+    uint1   B <: ( pix_x == 639 ) & ( pix_y == 479 );                                                                              // B vertical blank about to start
+
+    multiplex_display DISPLAY <@clock_system,!reset> (
+        V <: V,
+        terminal_display <: TERMINAL_MEMORY.pixel_display,
+        terminal_pixel <: TERMINAL_MEMORY.pixel
+    );
+
+    memory_main MAIN_MEMORY <@clock_system,!reset> (
+        TIMER_irq <: IO_MEMORY.PULSE_100Hz,
+
+        IO_in_data <: IO_MEMORY.MAIN_out_data,
+        TERMINAL_in_data <: TERMINAL_MEMORY.MAIN_out_data
+    );
+
+    memory_io IO_MEMORY <@clock_system,!reset> (
+        uart_tx :> uart_tx,                                                                                                     //  UART
+        uart_rx <: uart_rx,
+
+        us2_bd_dn <: us2_bd_dn,
+        us2_bd_dp <: us2_bd_dp,
+
+        MAIN_in_address <: MAIN_MEMORY.out_address,
+        MAIN_in_data <: MAIN_MEMORY.out_data,
+
+        MAIN_req_read <: MAIN_MEMORY.IO_req_read,
+        MAIN_req_write <: MAIN_MEMORY.IO_req_write
+    );
+
+    memory_terminal TERMINAL_MEMORY <@clock_system,!reset> (
+        CLOCK_VIDEO <: $clock_25mhz$,
+        PULSE_1Hz <: IO_MEMORY.PULSE_1Hz,
+        X <: X, Xp1 <: Xp1, Y <: Y,
+
+        MAIN_in_address <: MAIN_MEMORY.out_address,
+        MAIN_in_data <: MAIN_MEMORY.out_data,
+
+        MAIN_req_read <: MAIN_MEMORY.TERMINAL_req_read,
+        MAIN_req_write <: MAIN_MEMORY.TERMINAL_req_write,
+    );
+
+    DISPLAY.background_pixel := 8hff;
+
+    $$if VGA then
+        video_r := DISPLAY.pix_red[2,6]; video_g := DISPLAY.pix_green[2,6]; video_b := DISPLAY.pix_blue[2,6];
+    $$end
+}

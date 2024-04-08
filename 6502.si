@@ -1,0 +1,549 @@
+unit CPU6502(
+    input   uint1   TIMER_irq,
+    input   uint1   UART_irq,
+
+    output  uint16  out_address,
+    output  uint1   out_wrappage,
+    output  uint24  out_data,
+    input   uint24  in_data,
+
+    output  uint3   req_mask,
+    output  uint1   req_read,
+    output  uint1   req_write,
+    input   uint1   mem_busy,
+
+    input   uint1   RUN,
+    input   uint1   RESET,
+    input   uint1   DEBUG
+) <reginputs> {
+    uint1   IRQ <:: TIMER_irq;
+
+    uint16  VECTORS[3] = uninitialised;                                                                                         // FROM ROM, NMI, RES, IRQ VECTORS
+
+    uint16  PC = uninitialised; uint16  PCnext <:: PC + MCODE.i_length;                                                         // PC AND PC FOR FOLLOWING INSTRUCTION (no jump/branch)
+    uint16  PCjsr <:: PC + 2;                                                                                                   // PC TO PUSH TO STACK FOR JSR
+    uint16  PCrts <:: in_data[0,16] + 1;
+    uint16  PCbrx <:: PCnext + { {8{MCODE.value_16[15,1]}}, MCODE.value_16[8,8] };
+    uint8   REGS[4] = { 0, 0, 0, 0 };                                                                                           // { SP Y X A }
+    uint8   SPm1 <:: REGS[3] - 1; uint8   SPm2 <:: REGS[3] - 2; uint8   SPm3 <:: REGS[3] - 3;                                   // STACK OFFSETS    PUSH
+    uint8   SPp1 <:: REGS[3] + 1; uint8   SPp2 <:: REGS[3] + 2; uint8   SPp3 <:: REGS[3] + 3;                                   //                  PULL
+
+    uint16  ADDR = uninitialised;
+    uint8   VALUE_8 = uninitialised;
+    uint1   JUMPBRANCH = uninitialised;
+    uint9   RESULT = uninitialised;                                                                                             // RESULT, 1 EXTRA BIT FOR UNDERFLOW / OVERFLOW
+    uint2   REGISTER = uninitialised;
+
+    microcode_6502 MCODE( fetch <: in_data, X <: REGS[1], Y <: REGS[2], PC <: PC );                                             // CONVERT 6502 INSTRUCTIONS to MCODE opcode, address mode, etc
+    sr_6502 SR();                                                                                                               // 6502 STATUS REGISTER
+
+    uint8   SUB_A <: REGS[ ~MCODE.i_mcode[4,1] ? 0 : MCODE.i_mcode[0,2] ];                                                      // SBC CMP CPX CPY, SET REGISTER A, X, Y
+    uint1   SUB_cflag <: ~MCODE.i_mcode[4,1] ? SR.C : 1;                                                                        // SBC CMP CPX CPY, SELECT C FLAG
+    uint1   SUB_dflag <: ~MCODE.i_mcode[4,1] ? SR.SR[3,1] : 0;                                                                  // SBC CMP CPX CPY SELECT D FLAG
+    add_6502 ADD( A <: REGS[0], VALUE_8 <: VALUE_8, Cflag <: SR.C, Dflag <: SR.SR[3,1] );                                       // ADD WITH CARRY
+    sub_6502 SUB( A <: SUB_A, VALUE_8 <: VALUE_8, Cflag <: SUB_cflag, Dflag <: SUB_dflag );                                     // SUB WITH CARRY, OR CMP CPX CPY
+
+    aox_6502 AOX( OP <: MCODE.i_mcode[0,3], A <: REGS[0], VALUE_8 <: VALUE_8 );                                                 // AND XOR OR
+
+    uint8   SHIFT_VALUE_8 <: ~MCODE.i_mcode[4,1] ? VALUE_8 : REGS[0];                                                           // ASL, SRL, ROL, ROR SELECT ACCUMULATOR OR MEMORY
+    asl_6502 ASL( VALUE_8 <: SHIFT_VALUE_8 );
+    lsr_6502 LSR( VALUE_8 <: SHIFT_VALUE_8 );
+    rol_6502 ROL( VALUE_8 <: SHIFT_VALUE_8, C <: SR.C );
+    ror_6502 ROR( VALUE_8 <: SHIFT_VALUE_8, C <: SR.C );
+
+    uint8   CLSEMASK <:: 1 << MCODE.i_mcode[0,3];
+    uint8   CLSEVALUE <:: MCODE.i_mcode[3,1] << MCODE.i_mcode[0,3];
+
+    uint8   INC <:: ( &MCODE.i_mcode[0,2] ? VALUE_8 : REGS[ MCODE.i_mcode[0,2] ] ) + 1;                                         //  INC, INC A, INX, INY
+    uint8   DEC <:: ( &MCODE.i_mcode[0,2] ? VALUE_8 : REGS[ MCODE.i_mcode[0,2] ] ) - 1;                                         //  DEC, DEC A, DEX, DEY
+
+    req_read := 0; req_write := 0; MCODE.latch := 0; SR.update := 0;                                                            // HOLD MEMORY FLAGS AND LATCHES AT 0
+
+    algorithm <autorun> {
+        uint16  resetCounter = -1;                                                                                              // RESET COUNTER
+        uint16  resetNEXT <:: resetCounter - ~( mem_busy );                                                                     // -1 WHEN ALL UNITS READY
+        while( |resetCounter ) { resetCounter = resetNEXT; }                                                                    // DELAY STARTUP
+
+        out_wrappage = 0;
+        out_address = 16hFFFA; req_read = 1; while( mem_busy ) {} VECTORS[0] = in_data[0,16];                                   // FETCH NMI VECTOR
+        out_address = 16hFFFE; req_read = 1; while( mem_busy ) {} VECTORS[2] = in_data[0,16];                                   // FETCH IRQ VECTOR
+        out_address = 16hFFFC; req_read = 1; while( mem_busy ) {} VECTORS[1] = in_data[0,16];                                   // FETCH RESET VECTOR
+        PC = in_data[0,16]; out_address = in_data[0,16]; req_read = 1;                                                          // FETCH FIRST INSTRUCTION
+
+        while(1) {
+            while( RUN ) {
+                REGISTER = 0; JUMPBRANCH = 0; SR.mask = 0;                                                                      // SET RESULT REGISTER TO A, CLEAR JUMPBRANCH FLAG, FLAGS MASK
+                while( mem_busy ) {} MCODE.latch = 1; ++: ++: ++: ++:                                                           // WAIT FOR FETCH TO FINISH, LATCH INSTRUCTION
+
+                if( MCODE.i_indirect | MCODE.i_actions[1,1] | ( MCODE.i_actions[0,1] & ~MCODE.i_immediate ) ) {                 // IF INDIRECTION OR PULL/8 BIT FETCH REQUIRED
+                    if( MCODE.i_indirect ) {                                                                                    // IF INDIRECT FETCH NEW EFFECTIVE ADDRESS
+                        out_wrappage = MCODE.i_zp_wrap; out_address = MCODE.i_ea; req_read = 1; while( mem_busy ) {}
+                    }
+                    out_wrappage = 0; ADDR = ( MCODE.i_indirect ? in_data[0,16] : MCODE.i_ea ) + MCODE.i_ea_offset;             // SET EFFECTIVE ADDRESS INDIRECT OR FROM MICROCODE
+                    if( MCODE.i_actions[1,1] | ( MCODE.i_actions[0,1] & ~MCODE.i_immediate ) ) {                                // FETCH 8 BIT VALUE_8 OR PULL FROM STACK
+                        out_wrappage = MCODE.i_actions[1,1]; out_address = MCODE.i_actions[1,1] ? { 1b1, SPp1 } : ADDR;         //  WRAP IF PULL FROM STACK
+                        req_read = 1; while( mem_busy ) {}  VALUE_8 = in_data[0,8];
+                    }
+                } else {
+                    ADDR = MCODE.i_ea + MCODE.i_ea_offset;                                                                      // USE ADDRESS DIRECTLY
+                    VALUE_8 = MCODE.value_8;                                                                                    // USE IMMEDIATE VALUE
+                }
+                RESULT = VALUE_8;                                                                                               // SET DEFAULT RESULT
+
+                switch( MCODE.i_mcode[4,4] ) {
+                    case 4h0: {                                                                                                 // ARITHMETIC
+                        switch( MCODE.i_mcode[0,4] ) {
+                            case 4h1: { RESULT = ADD.RESULT; SR.mask = 8b11000011; SR.flags = ADD.SR; }                         //  ADC
+                            case 4h2: { RESULT = SUB.RESULT; SR.mask = 8b11000011; SR.flags = SUB.SR; }                         //  SBC
+                            case 4h3: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                         //  AND, SET NZ FLAGS
+                            case 4h4: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                         //  EOR, SET NZ FLAGS
+                            case 4h5: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                         //  OR, SET NZ FLAGS
+                            case 4h6: { RESULT = ASL.RESULT; SR.mask = 8b10000011; SR.flags = ASL.SR; }                         //  ASL, SET NZC FLAGS
+                            case 4h7: { RESULT = LSR.RESULT; SR.mask = 8b10000011; SR.flags = LSR.SR; }                         //  LSR, SET NZC FLAGS
+                            case 4h8: { RESULT = ROL.RESULT; SR.mask = 8b10000011; SR.flags = ROL.SR; }                         //  ROL, SET NZC FLAGS
+                            case 4h9: { RESULT = ROR.RESULT; SR.mask = 8b10000011; SR.flags = ROR.SR; }                         //  ROR,SET NZC FLAGS
+                            case 4ha: {                                                                                         //  BIT
+                                SR.mask = MCODE.i_immediate ? 8b00000010 : 8b11000010;                                          //      ( 65c02 ) IMM MODE ONLY AFFECTS Z FLAG
+                                SR.flags = { VALUE_8[6,2], 4b0000, ~|( VALUE_8 & REGS[0] ), 1b0 };                              //      SET N = bit 7, V = bit 6, AND Z FLAGS
+                            }
+                            default: {}                                                                                         // UNDEFINED, TREAT AS NOP
+                        }
+                    }
+                    case 4h1: { JUMPBRANCH = ( SR.SR[ MCODE.i_mcode[0,3], 1 ] == MCODE.i_mcode[3,1] ); }                        // BRANCH, TEST FLAG[ MCODE.i_mcode[0,3] ] == OPCDOE[3,1]
+                    case 4h2: { SR.mask = CLSEMASK; SR.flags = CLSEVALUE; }                                                     // SET FLAG[ MCODE.i_mcode[3,1] ] TO MCODE.i_mcode[3,1]
+                    case 4h3: { SR.mask = 8b10000011; SR.flags = SUB.SR; }                                                      // COMPARE, USE SUBTRACT, IGNORE OVERFLOW FLAG
+                    case 4h4: {
+                        if( MCODE.i_mcode[3,1] ) { RESULT = INC; } else { RESULT = DEC; }                                       // INC/DEC MEMORY, A, X OR Y
+                        SR.mask = 8b10000010; SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };                          //  SET NZ FLAGS
+                        REGISTER = MCODE.i_mcode[0,2];                                                                          //  SET DESTINATION REGISTER
+                    }
+                    case 4h5: {                                                                                                 // JMP JSR RTS RTI
+                        if( MCODE.i_mcode[3,1] ) {                                                                              // RTI RTS
+                            if( MCODE.i_mcode[0,1] ) {
+                                SR.mask = 8b11111111; SR.flags = VALUE_8; ADDR = in_data[8,16];                                 //  RTI FETCH STATUS REGISTER AND RETURN ADDRESS
+                                RESULT = SPp3;                                                                                  //   UPDATE STACK
+                            } else {
+                                ADDR = PCrts; RESULT = SPp2;                                                                    //  RTS FETCH RETURN ADDRESS AND +1, UPDATE STACK
+                            }
+                        } else {
+                            if( MCODE.i_mcode[0,1] ) {
+                                out_address = { 1b1, SPm1 }; req_mask = 2b11; out_data = PCjsr;                                 //  JSR, WRITE PC+2 TO STACK
+                                RESULT = SPm2; out_wrappage = 1; req_write = 1;
+                            }
+                        }
+                        REGISTER = 3; JUMPBRANCH = 1;
+                    }
+                    case 4h6: {                                                                                                 // LDx STx
+                        if( MCODE.i_mcode[3,1] ) { RESULT = &MCODE.i_mcode[0,3] ? 0 : REGS[ MCODE.i_mcode[0,2] ]; }             //  STZ STA STX STY ( LDx ALREADY ASSIGNED TO VALUE_8 )
+                        REGISTER = MCODE.i_mcode[0,2];
+                        SR.mask = 8b10000010; SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };
+                    }
+                    case 4h7: {                                                                                                 // ACCUMULATOR SHIFTS/ROTATES
+                        SR.mask = 8b10000011;                                                                                   // SET FLAGS MASK, NZC
+                        switch( MCODE.i_mcode[0,2] ) {
+                            case 0: { RESULT = ASL.RESULT; SR.flags = ASL.SR; }                                                 //  ASL
+                            case 1: { RESULT = LSR.RESULT; SR.flags = LSR.SR; }                                                 //  LSR
+                            case 2: { RESULT = ROL.RESULT; SR.flags = ROL.SR; }                                                 //  ROL
+                            case 3: { RESULT = ROR.RESULT; SR.flags = ROR.SR; }                                                 //  ROR
+                        }
+                    }
+                    case 4h8: {                                                                                                 // PUSH / PULL
+                        if( MCODE.i_mcode[3,1] ) {                                                                              // PULL
+                            REGISTER = MCODE.i_mcode[0,2];                                                                      //  USE VALUE_8 FOR RESULT AND SET REGISTER DESTINATION
+                            SR.mask = MCODE.i_mcode[2,1] ? 8b11111111 : 8b10000010;                                             //  SET FLAGS MASK, ALL IF PLP
+                            SR.flags = MCODE.i_mcode[2,1] ? VALUE_8 : { VALUE_8[7,1], 5b00000, ~|VALUE_8[0,8], 1b0 };           //  SET FLAGS VALUE_8 IF PLP ELSE NZ FLAGS
+                            REGS[3] = SPp1;                                                                                     //  ADJUST STACK POINTER
+                        } else {
+                            out_address = { 1b1, REGS[3] }; req_mask = 2b01;                                                    // PUSH PREPARE WRITE TO STACK
+                            out_data = MCODE.i_mcode[2,1] ? SR.SR | 8b00010000 : REGS[ MCODE.i_mcode[0,2] ];                    //  FLAGS OR REGISTER VALUE
+                            REGS[3] = SPm1; out_wrappage = 1; req_write = 1;                                                    //  PREPARE WRITE
+                        }
+                    }
+                    case 4h9: {                                                                                                 // TRANSFER { 9, fftt } where ff FROM and tt TO
+                        RESULT = REGS[ MCODE.i_mcode[2,2] ];                                                                    //  ==0 A, ==1 X, ==2 Y, ==3 SP
+                        SR.mask = &MCODE.i_mcode[0,2] ? 8b00000000 : 8b10000010;                                                // TRANSFER TO SP NO FLAGS, OTHERWISE NZ FLAGS AFFECTED
+                        SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };                                                // SET N AND Z FLAGS
+                        REGISTER = MCODE.i_mcode[0,2];
+                    }
+                    case 4ha: {
+                        if( ~MCODE.i_mcode[0,1] ) {
+                            out_address = { 1b1, SPm2 }; out_data = { PCnext, SR.SR | 5b10000 };                                // BRK, WRITE { PCnext, SR inc B flag } TO STACK
+                            out_wrappage = 1; req_mask = 3b111; req_write = 1;                                                  //  START PUSH
+                            SR.mask = 8b00010100; SR.flags = 8b00010100; ADDR = VECTORS[2]; JUMPBRANCH = 1;                     //  JUMP TO IRQ VECTOR NOTE: CHECK I SET TO  DISABLED
+                        }
+                        RESULT = SPm3; REGISTER = 3;                                                                            // UPDATE STACK, IGNORED BY NOP
+                    }
+                    case 4hb: {
+                        switch( MCODE.i_mcode[0,2] ) {
+                            default: {                                                                                          // TRB TSB
+                                RESULT = MCODE.i_mcode[3,1] ? ( VALUE_8 | REGS[0] ): ( VALUE_8 & ~REGS[0] );                    //      RESET/SET BITS AS MASKED BY ACCUMULATOR
+                                SR.mask = 8b00000010; SR.flags = { 6b00000, ~|( VALUE_8 & REGS[0] ), 1b0 };                     //      Z IF VALUE_8 & A == 0
+                            }
+                            case 2b01: {                                                                                        // BBRx BBSx
+                                JUMPBRANCH = ( VALUE_8[ MCODE.i_6502_high[0,3], 1 ] == MCODE.i_mcode[3,1] );                    //      BRANCH IF BIT 0 (R) OR (1) S
+                                ADDR = PCbrx;                                                                                   //      RELATIVE BRANCH
+                            }
+                            case 2b10: { RESULT[ MCODE.i_6502_high[0,3], 1 ] = MCODE.i_mcode[3,1]; }                            // RMBx SMBx, CLEAR / SET BIT
+                        }
+                    }
+                    default: {}                                                                                                 // UNDEFINED
+                }
+
+                if( MCODE.i_actions[3,1] ) {                                                                                    // WRITE 8 BIT VALUE_8 TO MEMORY
+                    out_wrappage = MCODE.i_zp_wrap; out_address = ADDR; req_mask = 2b01; out_data = RESULT; req_write = 1;
+                }
+
+                if( MCODE.i_actions[5,1] ) { REGS[ REGISTER ] = RESULT[0,8]; }                                                  // COMMIT TO REGISTER
+                SR.update = MCODE.i_actions[6,1];                                                                               // UPDATE SR
+
+                while( mem_busy ) {}                                                                                            // WAIT FOR STORE/PUSH TO FINISH
+
+                if( IRQ & ~SR.SR[2,1] ) {
+                    out_address = { 1b1, SPm2 }; out_data = { JUMPBRANCH ? ADDR : PCnext, { SR.SR[5,3], 1b0, SR.SR[0,4] } };    // IRQ, WRITE { PCnext, SR } TO STACK
+                    out_wrappage = 1; req_mask = 3b111; req_write = 1;
+                    SR.mask = 8b00010100; SR.flags = 8b00000100; SR.update = 1; while( mem_busy ) {}                            //  START PUSH, UPDATE STATUS TO SEI
+                    ADDR = VECTORS[2]; JUMPBRANCH = 1;                                                                          //  JUMP TO IRQ VECTOR NOTE
+                    REGS[3] = SPm3;                                                                                             // UPDATE STACK
+                }
+
+                out_wrappage = 0; out_address = JUMPBRANCH ? ADDR : PCnext; PC = JUMPBRANCH ? ADDR : PCnext; req_read = 1;      // FETCH NEXT INSTRUCTION
+            }
+        }
+    }
+}
+
+// FLAGS
+//  { N V - B D I Z C }
+//  07 N NEGATIVE
+//  06 V OVERFLOW
+//  05
+//  04 B BREAK
+//  03 D DECIMAL
+//  02 I INTERRUPT
+//  01 Z ZERO
+//  00 C CARRY
+
+unit sr_6502(
+    output  uint8   SR(8b00100100),
+    output  uint1   C,
+    input   uint8   mask,
+    input   uint8   flags,
+    input   uint1   update
+) <reginputs> {
+    C := SR[0,1];
+
+    algorithm <autorun> { while(1) {
+        if( update ) {
+            SR = {
+                mask[7,1] ? flags[7,1] : SR[7,1],
+                mask[6,1] ? flags[6,1] : SR[6,1],
+                1b1,                                                                                                            // ENSURE BITS 5 IS SET
+                mask[4,1] ? flags[4,1] : SR[4,1],
+                mask[3,1] ? flags[3,1] : SR[3,1],
+                mask[2,1] ? flags[2,1] : SR[2,1],
+                mask[1,1] ? flags[1,1] : SR[1,1],
+                mask[0,1] ? flags[0,1] : SR[0,1]
+            };
+        }
+    } }
+}
+
+// CONVERT 6502 OPCODES INTO MICROCODES + ADDRESS MODE + ACTION FLAGS, CALCULATE BASE EFFECTIVE ADDRESS ( INDIRECT WILL REQUIRE A READ FROM THIS EA )
+unit microcode_6502(
+    input   uint24  fetch,
+    input   uint1   latch,
+    input   uint8   X,
+    input   uint8   Y,
+    input   uint16  PC,
+    output  uint4   i_6502_low,
+    output  uint4   i_6502_high,
+    output  uint8   i_mcode,
+    output  uint4   i_amode,
+    output  uint7   i_actions,
+    output  uint2   i_length,
+    output  uint1   i_indirect,
+    output  uint1   i_immediate,
+    output  uint1   i_zp_wrap,
+    output  uint8   value_8,
+    output  uint16  value_16,
+    output  uint16  i_ea,
+    output  uint8   i_ea_offset,
+) <reginputs> {
+    // { change status, commit, push, store 8, multi-cycle, pop, fetch 8 }
+    brom uint7 mcode_actions[] = {
+//                 01 ADC     02 SBC     03 AND     04 EOR     05 ORA     06 ASL     07 LSR     08 ROL     09 ROR     0A BIT
+        7b0000000, 7b1100001, 7b1100001, 7b1100001, 7b1100001, 7b1100001, 7b1001001, 7b1001001, 7b1001001, 7b1001001, 7b1000001, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+//      10 BCC     11 BNE                                                 16 BVC     17 BPL     18 BCS     19 BEQ                                      1D BRA     1E BVS     1F BMI
+        7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+//      20 CLC                22 CLI     23 CLD                           26 CLV                28 SEC                2A SEI     2B SED
+        7b1000000, 7b0000000, 7b1000000, 7b1000000, 7b0000000, 7b0000000, 7b1000000, 7b0000000, 7b1000000, 7b0000000, 7b1000000, 7b1000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+//      30 CMP     31 CPX     32 CPY
+        7b1000001, 7b1000001, 7b1000001, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+//      40 DEC A   41 DEX     42 DEY     43 DEC                                                 48 INC A   49 INX     4A INY     4B INC
+        7b1100000, 7b1100000, 7b1100000, 7b1001001, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b1100000, 7b1100000, 7b1100000, 7b1001001, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+//      50 JMP     51 JSR                                                                       58 RTS     59 RTI
+        7b0000000, 7b0110000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0100010, 7b1100010, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+//      60 LDA     61 LDX     62 LDY                                                            68 STA     69 STX     6A STY                                                 6F STZ
+        7b1100001, 7b1100001, 7b1100001, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0001000, 7b0001000, 7b0001000, 7b0001000, 7b0001000, 7b0001000, 7b0001000, 7b0001000,
+//      70 ASL A   71 LSR A   72 ROL A   73 ROR A
+        7b1100000, 7b1100000, 7b1100000, 7b1100000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+//      80 PHA     81 PHX     82 PHY                84 PHP                                      88 PLA     89 PLX     8A PLY                8C PLP
+        7b0010000, 7b0010000, 7b0010000, 7b0000000, 7b0010000, 7b0000000, 7b0000000, 7b0000000, 7b1100010, 7b1100010, 7b1100010, 7b0000000, 7b1000010, 7b0000000, 7b0000000, 7b0000000,
+//                 91 TAX     92 TAY                94 TXA                           97 TXS     98 TYA                                                 9D TSX
+        7b0000000, 7b1100000, 7b1100000, 7b0000000, 7b1100000, 7b0000000, 7b0000000, 7b0100000, 7b1100000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b1100000, 7b0000000, 7b0000000,
+//      A0 BRK     A1 NOP
+        7b1100000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+//      B0 TRB     B1 BBRx    B2 RMBx                                                           B8 TSB     B9 BBSx    BA SMBx
+        7b1001001, 7b0000001, 7b0001001, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b1001001, 7b0000001, 7b0001001, 7b0000000, 7b0000000, 7b0000000, 7b0000000, 7b0000000,
+    };
+
+    // MAPS 6502 OPCODES TO THE MICROCODE, AS MAPPED ABOVE
+    brom uint8 insn6502_to_mcode[] = {
+        //  x0    x1    x2    x3    x4    x5    x6    x7    x8    x9    xa    xb    xc    xd    xe    xf
+          8hA0, 8h05, 8h00, 8h00, 8hB8, 8h05, 8h06, 8hB2, 8h84, 8h05, 8h70, 8h00, 8hB8, 8h05, 8h06, 8hB1,   // 0x
+          8h17, 8h05, 8h05, 8h00, 8hB0, 8h05, 8h06, 8hB2, 8h20, 8h05, 8h48, 8h00, 8hB0, 8h05, 8h06, 8hB1,   // 1x
+          8h51, 8h03, 8h00, 8h00, 8h0A, 8h03, 8h08, 8hB2, 8h8C, 8h03, 8h72, 8h00, 8h0A, 8h03, 8h08, 8hB1,   // 2x
+          8h1F, 8h03, 8h03, 8h03, 8h0A, 8h03, 8h08, 8hB2, 8h28, 8h03, 8h40, 8h00, 8h0A, 8h03, 8h08, 8hB1,   // 3x
+          8h59, 8h04, 8h00, 8h00, 8h00, 8h04, 8h07, 8hB2, 8h80, 8h04, 8h71, 8h00, 8h50, 8h04, 8h07, 8hB1,   // 4x
+          8h16, 8h04, 8h04, 8h00, 8h00, 8h04, 8h07, 8hB2, 8h22, 8h04, 8h82, 8h00, 8h00, 8h04, 8h07, 8hB1,   // 5x
+          8h58, 8h01, 8h00, 8h00, 8h6F, 8h01, 8h09, 8hB2, 8h88, 8h01, 8h73, 8h00, 8h50, 8h01, 8h09, 8hB1,   // 6x
+          8h1E, 8h01, 8h01, 8h00, 8h6F, 8h01, 8h09, 8hB2, 8h2A, 8h01, 8h8A, 8h00, 8h50, 8h01, 8h09, 8hB1,   // 7x
+          8h1D, 8h68, 8h00, 8h00, 8h6A, 8h68, 8h69, 8hBA, 8h42, 8h0A, 8h94, 8h00, 8h6A, 8h68, 8h69, 8hB9,   // 8x
+          8h10, 8h68, 8h68, 8h00, 8h6A, 8h68, 8h69, 8hBA, 8h98, 8h68, 8h97, 8h00, 8h6F, 8h68, 8h6F, 8hB9,   // 9x
+          8h62, 8h60, 8h61, 8h00, 8h62, 8h60, 8h61, 8hBA, 8h92, 8h60, 8h91, 8h00, 8h62, 8h60, 8h61, 8hB9,   // Ax
+          8h18, 8h60, 8h60, 8h00, 8h62, 8h60, 8h61, 8hBA, 8h26, 8h60, 8h9D, 8h00, 8h62, 8h60, 8h61, 8hB9,   // Bx
+          8h32, 8h30, 8h00, 8h00, 8h32, 8h30, 8h43, 8hBA, 8h4A, 8h30, 8h41, 8h00, 8h32, 8h30, 8h43, 8hB9,   // Cx
+          8h11, 8h30, 8h30, 8h00, 8h00, 8h30, 8h43, 8hBA, 8h23, 8h30, 8h81, 8h00, 8h00, 8h30, 8h43, 8hB9,   // Dx
+          8h31, 8h02, 8h00, 8h00, 8h31, 8h02, 8h4B, 8hBA, 8h49, 8h02, 8hA1, 8h00, 8h31, 8h02, 8h4B, 8hB9,   // Ex
+          8h19, 8h02, 8h02, 8h00, 8h00, 8h02, 8h4B, 8hBA, 8h2B, 8h02, 8h89, 8h00, 8h00, 8h02, 8h4B, 8hB9    // Fx
+    };
+
+    // ADDRESSING MODES
+    //  00 UNDEFINED
+    //  01 ACCUMULATOR,IMPLIED  OPC A or OPC        ( single byte instruction )
+    //  02 ABSOLUTE             OPC $LLHH           operand is 16-bit address
+    //  03 ABSOLUTE X INDEX     OPC $$LLHH,X        operand is address, effective address is +X with carry
+    //  04 ABSOLUTE Y INDEX     OPC $$LLHH,Y        operand is address, effective address is +Y with carry
+    //  05 BYTE IMMEDIATE       OPC $BB             operand is byte
+    //  06 (IND)                OPC ($LLHH)         operand is address, effective address is contents of word at address
+    //  07 X INDEX, (IND)       OPC ($LL,X)         operand is zeropage address, effective address is word in ( LL+X, LL+X+1 ) without carry
+    //  08 IND, Y               OPC ($LL),Y         operand is zeropage address, effective address is word in ( LL, LL+1 ) incremented by Y with carry
+    //  09 RELATIVE             OPC $BB             branch target is PC + signed offset BB
+    //  0A ZEROPAGE             OPC $LL             operand is zeropage address
+    //  0B ZEROPAGE X INDEX     OPC $LL,X           operand is zeropage address, effective address is address incremented by X without carry
+    //  0C ZEROPAGE Y INDEX     OPC $LL,Y           operand is zeropage address, effective address is address incremented by Y without carry
+    //  0D 65c02 ZP (IND)       OPC ($LL)           operand is zeropage address, effective address is word in ( LL, LL+1 )
+    //  0E 65c02 X INDEX, (IND) OPC ($LLHH,X)       operand is address, effective address is word in ( LLHH+X, LLHH+X+1 )
+    //  0F 65c02 ZP, RELATIVE   OPC $LL,$BB         operand is zeropage address, branch target is PC + signed offset BB
+    brom uint4 insn6502_to_amode[] = {
+        //   0     1     2     3     4     5     6     7     8     9     A     B     C     D     E     F
+          4h05, 4h07, 4h00, 4h00, 4h0A, 4h0A, 4h0A, 4h0A, 4h01, 4h05, 4h01, 4h00, 4h02, 4h02, 4h02, 4h0F,                   // 0x
+          4h09, 4h08, 4h0D, 4h00, 4h0A, 4h0B, 4h0B, 4h0A, 4h01, 4h04, 4h01, 4h00, 4h02, 4h03, 4h03, 4h0F,                   // 1x
+          4h02, 4h07, 4h00, 4h00, 4h0A, 4h0A, 4h0A, 4h0A, 4h01, 4h05, 4h01, 4h00, 4h02, 4h02, 4h02, 4h0F,                   // 2x
+          4h09, 4h08, 4h0D, 4h00, 4h0B, 4h0B, 4h0B, 4h0A, 4h01, 4h04, 4h01, 4h00, 4h03, 4h03, 4h03, 4h0F,                   // 3x
+          4h01, 4h07, 4h00, 4h00, 4h00, 4h0A, 4h0A, 4h0A, 4h01, 4h05, 4h01, 4h00, 4h02, 4h02, 4h02, 4h0F,                   // 4x
+          4h09, 4h08, 4h0D, 4h00, 4h00, 4h0B, 4h0B, 4h0A, 4h01, 4h04, 4h01, 4h00, 4h00, 4h03, 4h03, 4h0F,                   // 5x
+          4h01, 4h07, 4h00, 4h00, 4h0A, 4h0A, 4h0A, 4h0A, 4h01, 4h05, 4h01, 4h00, 4h06, 4h02, 4h02, 4h0F,                   // 6x
+          4h09, 4h08, 4h0D, 4h00, 4h0B, 4h0B, 4h0B, 4h0A, 4h01, 4h04, 4h01, 4h00, 4h0E, 4h03, 4h03, 4h0F,                   // 7x
+          4h09, 4h07, 4h00, 4h00, 4h0A, 4h0A, 4h0A, 4h0A, 4h01, 4h05, 4h01, 4h00, 4h02, 4h02, 4h02, 4h0F,                   // 8x
+          4h09, 4h08, 4h0D, 4h00, 4h0B, 4h0B, 4h0C, 4h0A, 4h01, 4h04, 4h01, 4h00, 4h02, 4h03, 4h03, 4h0F,                   // 9x
+          4h05, 4h07, 4h05, 4h00, 4h0A, 4h0A, 4h0A, 4h0A, 4h01, 4h05, 4h01, 4h00, 4h02, 4h02, 4h02, 4h0F,                   // Ax
+          4h09, 4h08, 4h0D, 4h00, 4h0B, 4h0B, 4h0C, 4h0A, 4h01, 4h04, 4h01, 4h00, 4h03, 4h03, 4h04, 4h0F,                   // Bx
+          4h05, 4h07, 4h00, 4h00, 4h0A, 4h0A, 4h0A, 4h0A, 4h01, 4h05, 4h01, 4h00, 4h02, 4h02, 4h02, 4h0F,                   // Cx
+          4h09, 4h08, 4h0D, 4h00, 4h00, 4h0B, 4h0B, 4h0A, 4h01, 4h04, 4h01, 4h00, 4h00, 4h03, 4h03, 4h0F,                   // Dx
+          4h05, 4h07, 4h00, 4h00, 4h0A, 4h0A, 4h0A, 4h0A, 4h01, 4h05, 4h01, 4h00, 4h02, 4h02, 4h02, 4h0F,                   // Ex
+          4h09, 4h08, 4h0D, 4h00, 4h00, 4h0B, 4h0B, 4h0A, 4h01, 4h04, 4h01, 4h00, 4h00, 4h03, 4h03, 4h0F                    // Fx
+    };
+
+    ea_6502 EA(
+        amode <: i_amode,
+        PC <: PC,
+        X <: X,
+        Y <: Y,
+        value_8 <: value_8,
+        value_16 <: value_16,
+        i_length :> i_length,
+        i_ea :> i_ea,
+        i_ea_offset :> i_ea_offset,
+        i_indirect :> i_indirect,
+        i_immediate :> i_immediate,
+        i_zp_wrap :> i_zp_wrap
+    );
+
+    mcode_actions.addr := insn6502_to_mcode.rdata;
+
+    i_mcode := insn6502_to_mcode.rdata;
+    i_amode := insn6502_to_amode.rdata;
+    i_actions := mcode_actions.rdata;
+
+    algorithm <autorun> { while(1) {
+        if( latch ) {
+            insn6502_to_mcode.addr = fetch[0,8];                                                                                // SELECT MICROCODE FROM ROM        6502 -> MCODE
+            insn6502_to_amode.addr = fetch[0,8];                                                                                // SELECT ADDRESS MODE FROM ROM     6502 -> AMODE
+            value_8 = fetch[8,8];                                                                                               // SELECT 8 BIT VALUE FOLLOWING INSTRUCTION
+            value_16 = fetch[8,16];                                                                                             // SELECT 16 BIT VALUE FOLLOWING INSTRUCTION
+            i_6502_low = fetch[0,4];                                                                                            // SELECT LOW NIBBLE OF 6502 INSTRUCTION
+            i_6502_high = fetch[4,4];                                                                                           // SELECT HIGH NIBBLE OF 6502 INSTRUCTION
+        }
+    } }
+}
+
+unit ea_6502(
+    input   uint4   amode,
+    input   uint8   X,
+    input   uint8   Y,
+    input   uint16  PC,
+    input   uint8   value_8,
+    input   uint16  value_16,
+    output  uint2   i_length,
+    output  uint16  i_ea,
+    output  uint8   i_ea_offset,
+    output  uint1   i_indirect,
+    output  uint1   i_immediate,
+    output  uint1   i_zp_wrap
+) <reginputs> {
+    i_indirect := 0; i_immediate := 0; i_ea := value_8; i_ea_offset := 0; i_zp_wrap := 0;
+
+    algorithm <autorun> {
+        uint16  BRANCHDEST <: PC + 2 + { {8{value_8[7,1]}}, value_8 };
+        uint8   ZP_X <: value_8 + X;
+        uint8   ZP_Y <: value_8 + Y;
+        uint16  ABS_X <: value_16 + X;
+        uint16  ABS_Y <: value_16 + Y;
+
+        while(1) {
+            switch( amode ) {
+                case 4h0: { i_length = 1; }                                                                                     // UNDEFINED, TREAT AS NOP
+                case 4h1: { i_length = 1; }                                                                                         // ACCUMULATOR OR IMPLIED, SINGLE BYTE INSTRUCTIONS
+                case 4h2: { i_length = 3; i_ea = value_16; }                                                                        // ABSOLUTE
+                case 4h3: { i_length = 3; i_ea = ABS_X; }                                                                    // ABSOLUTE X INDEX
+                case 4h4: { i_length = 3; i_ea = ABS_Y; }                                                                    // ABSOLUTE Y INDEX
+                case 4h5: { i_length = 2; i_ea = PC + 1; i_immediate = 1; }                                                         // IMMEDIATE
+                case 4h6: { i_length = 3; i_ea = value_16; i_indirect = 1; }                                                        // INDIRECT
+                case 4h7: { i_length = 2; i_ea = ZP_X; i_indirect = 1; i_zp_wrap = 1; }                           // ZP X INDEX INDIRECT
+                case 4h8: { i_length = 2; i_indirect = 1; i_ea_offset = Y; }                                        // ZP INDIRECT Y INDEX
+                case 4h9: { i_length = 2; i_ea = BRANCHDEST; }                                                                      // BRANCH DESTINATION
+                case 4hA: { i_length = 2; }                                                                         // ZERO PAGE ADDRESS
+                case 4hB: { i_length = 2; i_ea = ZP_X; }                                                          // ZERO PAGE X INDEX
+                case 4hC: { i_length = 2; i_ea = ZP_Y; }                                                          // ZERO PAGE Y INDEX
+                case 4hD: { i_length = 2; i_indirect = 1; }                                                         // ZP INDIRECT ( 65c02 )
+                case 4hE: { i_length = 3; i_ea = ABS_X; i_indirect = 1; }                                                    // INDIRECT X INDEX ( 65c02 )
+                case 4hF: { i_length = 3; }                                                                         // ZERO PAGE ADDRESS, RELATIVE ( 65c02 )
+            }
+        }
+    }
+}
+
+unit add_6502(
+    input   uint8   A,
+    input   uint8   VALUE_8,
+    input   uint1   Cflag,
+    input   uint1   Dflag,
+    output  uint8   RESULT,
+    output  uint8   SR,
+) <reginputs> {
+    uint9   TEMPadd <: A + VALUE_8 + Cflag;
+    uint4   low = uninitialised;
+    uint4   high = uninitialised;
+    uint1   carry = uninitialised;
+    uint1   halfcarry = uninitialised;
+
+    algorithm <autorun> { while(1) {
+        halfcarry = 0; carry = 0;
+        if( Dflag ) {
+            if( TEMPadd[0,4] > 9 ) { low = TEMPadd[0,4] - 9; halfcarry = 1; } else { low = TEMPadd[0,4];  }
+            if( ( TEMPadd[4,4] + halfcarry ) > 9 ) { high = TEMPadd[4,4] + halfcarry - 9; carry = 1; } else { high = TEMPadd[4,4] + halfcarry; }
+            RESULT = { high, low };
+        } else {
+            RESULT = TEMPadd;
+        }
+
+        SR = {
+                TEMPadd[7,1],                                                                                                   // N
+                ( A[7,1] == VALUE_8[7,1] ) ? ( A[7,1] ^ RESULT[7,1] ) : 1b0,                                                    // OVERFLOW
+                4b0000,
+                ~|RESULT[0,8],                                                                                                  // Z
+                TEMPadd[8,1]                                                                                                    // C CARRY
+            };
+    } }
+}
+unit sub_6502(
+    input   uint8   A,
+    input   uint8   VALUE_8,
+    input   uint1   Cflag,
+    input   uint1   Dflag,
+    output  uint8   RESULT,
+    output  uint8   SR
+) <reginputs> {
+    uint9   TEMPsub <: { A[7,1], A } - { VALUE_8[7,1], VALUE_8 } - ( Cflag ? 0 : 1 );
+    uint4   low = uninitialised;
+    uint4   high = uninitialised;
+    uint1   carry = uninitialised;
+    uint1   halfcarry = uninitialised;
+
+    algorithm <autorun> { while(1) {
+        if( Dflag ) {
+            RESULT = TEMPsub;
+        } else {
+            RESULT = TEMPsub;
+        }
+
+        SR = {
+                RESULT[7,1],                                                                                                    // N
+                ( __signed( TEMPsub ) > __signed( 127 ) ) | ( __signed( TEMPsub ) < __signed( -128 ) ),                         // V, OVERFLOW
+                4b0000,
+                ~|RESULT[0,8],                                                                                                  // Z
+                A >= ( VALUE_8 + ( Cflag ? 0 : 1 ) )                                                                                         // C !BORROW
+            };
+    } }
+}
+unit aox_6502(
+    input   uint3   OP,
+    input   uint8   A,
+    input   uint8   VALUE_8,
+    output  uint8   RESULT,
+    output  uint8   SR
+) <reginputs> {
+    algorithm <autorun> { while(1) {
+        switch( OP ) {
+            case 3: { RESULT = A & VALUE_8; }
+            case 4: { RESULT = A ^ VALUE_8; }
+            default: { RESULT = A | VALUE_8; }
+        }
+        SR = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };
+    } }
+}
+unit asl_6502(
+    input   uint8   VALUE_8,
+    output  uint8   RESULT,
+    output  uint8   SR
+) <reginputs> {
+    RESULT := VALUE_8 << 1;                                                                                                     // ASL
+    SR := { VALUE_8[6,1], 5b00000, ~|VALUE_8[0,7], VALUE_8[7,1] };                                                                // SET NZC FLAGS
+}
+unit lsr_6502(
+    input   uint8   VALUE_8,
+    output  uint8   RESULT,
+    output  uint8   SR
+) <reginputs> {
+    RESULT := VALUE_8 >> 1;                                                                                            // LSR
+    SR := { 6b000000, ~|VALUE_8[1,7], VALUE_8[0,1] };                                                                // SET NZC FLAGS
+}
+unit rol_6502(
+    input   uint8   VALUE_8,
+    input   uint1   C,
+    output  uint8   RESULT,
+    output  uint8   SR
+) <reginputs> {
+    RESULT := ( VALUE_8 << 1 ) | C;                                                                                              // ROL
+    SR := { VALUE_8[6,1], 5b00000, ~|VALUE_8[0,7] & ~C, VALUE_8[7,1] };                                                                // SET NZC FLAGS
+}
+unit ror_6502(
+    input   uint8   VALUE_8,
+    input   uint1   C,
+    output  uint8   RESULT,
+    output  uint8   SR
+) <reginputs> {
+    RESULT := ( VALUE_8 >> 1 ) | { C, 7b0000000 };                                                                                              // ROR
+    SR := { C, 5b00000, ~|VALUE_8[1,7] & ~C, VALUE_8[0,1] };                                                                // SET NZC FLAGS
+}

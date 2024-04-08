@@ -1,0 +1,176 @@
+;;;
+;;; CLS. Clear the screen.
+;;;
+
+* = $0300
+
+  jmp start
+
+;;; these variables are imported from the monitor/FORTH
+PRINTVEC=$0042
+INPUT=$7F00
+SCRATCH=$0010
+CURSEC=$0068
+WORD=$7EC0
+LBLOCK=$7C00
+HBLOCK=$7D00
+IOSENTINEL=$7E00
+KILLLINE=$7F80      ; and 7F81
+KILLBUFFER=$7F82    ; upper half of FORTH input buffer
+
+
+VROW=$0A
+VCOL=$0B
+
+DLSTOP=0
+DLSTART=$80
+DRAWSQUARE=$10
+FILL=$20
+
+#include "../decl.a65"
+#include "../stack.a65"
+#include "jmptable.a65"
+
+BG .byte 0, 0, 0
+FG .byte 0, 0, 0
+
+
+start
+
+  jsr cls
+  jsr home
+  stz VCOL
+  stz VROW
+  rts
+
+
+home
+  ldy #0
+  lda #$2a
+  jsr ROMWRVREG
+  ldy #0
+  lda #$2b
+  jsr ROMWRVREG
+  ldy #0
+  lda #$2c
+  jsr ROMWRVREG
+  lda #$2d
+  ldy #0
+  jsr ROMWRVREG
+  
+  rts
+
+
+;;; also include all the RA8875-specific definitions
+#include "spivdefs.a65"
+
+
+;;; fill screen with the current foreground color
+;;;
+fillscreen
+
+  ;; set up parameters -- startx, starty, endx, endy
+  lda #$91
+  ldy #0
+  jsr ROMWRVREG
+  ldy #0
+  lda #$92
+  jsr ROMWRVREG
+  ldy #0
+  lda #$93
+  jsr ROMWRVREG
+  ldy #0
+  lda #$94
+  jsr ROMWRVREG
+
+  lda #$95
+  ldy #$1F          ; lower byte for 799
+  jsr ROMWRVREG
+  lda #$96
+  ldy #03           ; upper byte for 799
+  jsr ROMWRVREG
+
+  lda #$97
+  ldy #$df          ; lower byte for 479
+  jsr ROMWRVREG
+  lda #$98          
+  ldy #$01          ; upper byte for 479
+  jsr ROMWRVREG
+
+  lda #DCR
+  ldy #DLSTOP|DRAWSQUARE
+  jsr ROMWRVREG
+  
+  lda #DCR
+  ldy #DLSTART|FILL|DRAWSQUARE
+  jsr ROMWRVREG
+
+  ;; wait until complete
+.(
+busyloop
+  lda #$90
+  jsr ROMRDVREG
+  bmi busyloop
+.)
+
+  rts
+
+;;; clear the screen by filling it with the current background
+;;; color.
+cls
+  jsr setupcolors
+  jsr fillscreen    ; waits until operation completed
+  jsr resetcolors
+  rts
+
+
+
+setupcolors
+  ;; cache the bg and fg colors
+  lda #$60
+  jsr ROMRDVREG
+  sta BG
+  lda #$61
+  jsr ROMRDVREG
+  sta BG+1
+  lda #$62
+  jsr ROMRDVREG
+  sta BG+2
+  lda #$63
+  jsr ROMRDVREG
+  sta FG
+  lda #$64
+  jsr ROMRDVREG
+  sta FG+1
+  lda #$65
+  jsr ROMRDVREG
+  sta FG+2
+
+  ;; set fg to bg
+  ldy BG
+  lda #$63
+  jsr ROMWRVREG
+  ldy BG+1
+  lda #$64
+  jsr ROMWRVREG
+  ldy BG+2
+  lda #$65
+  jsr ROMWRVREG
+
+  rts
+  
+
+resetcolors
+  ;; reset fg color (bg remains the same)
+  ;; set fg to bg
+  ldy FG
+  lda #$63
+  jsr ROMWRVREG
+  ldy FG+1
+  lda #$64
+  jsr ROMWRVREG
+  ldy FG+2
+  lda #$65
+  jsr ROMWRVREG
+  rts
+  

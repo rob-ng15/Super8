@@ -1,0 +1,147 @@
+// MEMMAP
+//  c000-       UART
+//  c010-       KBD
+//  c020-       TIMER
+unit memory_io(
+    input   uint8   MAIN_in_address,
+    input   uint8   MAIN_in_data,
+    output  uint8   MAIN_out_data,
+    input   uint1   MAIN_req_read,
+    input   uint1   MAIN_req_write,
+
+    output  uint1   uart_tx,
+    input   uint1   uart_rx,
+    // USB for PS/2
+    input   uint1   us2_bd_dp,
+    input   uint1   us2_bd_dn,
+
+    output  uint1   PULSE_1Hz,
+    output  uint1   PULSE_100Hz,
+) <reginputs> {
+    ps2_IN PS2_IN( us2_bd_dp <: us2_bd_dp, us2_bd_dn <: us2_bd_dn );
+
+    uart_IN UART_IN( uart_rx <: uart_rx );
+    uart_OUT UART_OUT( uart_tx :> uart_tx, out_data <: MAIN_in_data, req_write <: MAIN_req_write );
+
+    timer_pulse1hz CURSOR_BLINK( pulse1hz :> PULSE_1Hz );
+    timer_pulse100hz CENTISECOND( pulse100hz :> PULSE_100Hz );
+
+    UART_IN.req_read := 0; PS2_IN.req_read := 0;
+
+    algorithm <autorun> { while(1) {
+        switch( MAIN_in_address ) {
+            case 8h00: { MAIN_out_data = UART_OUT.out_full; }
+            case 8h02: { MAIN_out_data = UART_IN.out_available; }
+            case 8h03: { MAIN_out_data = UART_IN.in_data; UART_IN.req_read = MAIN_req_read; }
+            case 8h10: { MAIN_out_data = PS2_IN.key_available; }
+            case 8h11: { MAIN_out_data = PS2_IN.keycode; PS2_IN.req_read = MAIN_req_read; }
+            case 8h20: { MAIN_out_data = CENTISECOND.pulse100hz; }
+            case 8h21: { if( MAIN_req_write ) { CENTISECOND.enable = MAIN_in_data; } }
+            case 8h22: { CENTISECOND.acknowledge = MAIN_req_read; }
+            default: {}
+        }
+    } }
+}
+
+// FIFO BUFFER FOR 8 BITS, FIRST IN, LAST OUT
+// HOLDS 256 ENTRIES
+unit fifo8(
+    output  uint1   out_available,
+    output  uint1   in_full,
+    input   uint1   req_read,
+    input   uint1   req_write,
+    output  uint8   out_data,
+    input   uint8   in_data
+) <reginputs> {
+    simple_dualport_bram uint8 queue[256] = uninitialized;
+    uint8   next_p1 <:: queue.addr0 + 1;
+    uint8   top_p1 <:: queue.addr1 + 1;
+    uint8   top_p2 <:: queue.addr1 + 2;
+
+    queue.wenable1 := 0; queue.wdata1 := in_data; out_data := queue.rdata0;
+    out_available := ( top_p1 != queue.addr0 ); in_full := ( top_p2 == queue.addr0 );                                     // CHARACTER AVAILABLE? QUEUE FULL?
+
+    algorithm <autorun> {
+        queue.addr0 = 0; queue.addr1 = -1;
+
+        while(1) {
+            queue.addr1 = queue.addr1 + req_write; queue.wenable1 = req_write;
+            queue.addr0 = queue.addr0 + req_read;
+        }
+    }
+}
+
+unit uart_IN(
+    // UART
+    input   uint1   uart_rx,
+    output  uint1   out_available,
+    output  uint8   in_data,
+    input   uint1   req_read
+) <reginputs> {
+    uart_in ui; uart_receiver urecv( io <:> ui, uart_rx <: uart_rx );                                                           // CONNECT TO UART RECEIVE PINS
+    fifo8 IN( out_available :> out_available, out_data :> in_data, req_read <: req_read, in_data <: ui.data_out, req_write <: ui.data_out_ready );     // UART IN FIFO BUFFER
+}
+unit uart_OUT(
+    // UART
+    output  uint1   uart_tx,
+    output  uint1   out_full,
+    input   uint8   out_data,
+    input   uint1   req_write
+) <reginputs> {
+    uart_out uo; uart_sender usend( io <:> uo, uart_tx :> uart_tx );                                                            // CONNECT TO UART TRANSMIT PINS
+    fifo8 OUT( in_full :> out_full, in_data <: out_data, req_write <: req_write, out_data :> uo.data_in );                                      // UART OUT FIFO BUFFER
+    OUT.req_read := OUT.out_available & ~uo.busy; uo.data_in_ready := OUT.out_available & ~uo.busy;                                         // SEND TO UART IF CHARACTER AVAILABLE AND UART NOT BUSY
+}
+
+unit ps2_IN(
+    input   uint1   us2_bd_dp,
+    input   uint1   us2_bd_dn,
+    output  uint1   key_available,
+    output  uint8   keycode,
+    input   uint1   req_read
+) <reginputs> {
+    ps2 PS2( ps2clk_ext <: us2_bd_dp, ps2data_ext <: us2_bd_dn );
+    fifo8 IN( out_available :> key_available, in_data <: PS2.data, req_read <: req_read, out_data :> keycode, req_write <: PS2.valid );
+}
+
+// Create 1hz (1 second counter)
+unit timer_pulse1hz(
+    output  uint1   pulse1hz,
+    input   uint1   resetCounter
+) <reginputs> {
+    algorithm <autorun> {
+        uint26  counter50mhz = uninitialised;
+        uint1   zero <:: ~|counter50mhz;
+        uint26  counter50mhz_m1 <:: counter50mhz -1 ;
+
+        while(1) {
+            if( resetCounter ) {
+                pulse1hz = 0; counter50mhz = 50000000;
+            } else {
+                if( zero ) { pulse1hz = ~pulse1hz; counter50mhz = 50000000; } else { counter50mhz = counter50mhz_m1; }
+            }
+        }
+    }
+}
+
+// Create 100hz ( 100 times per second pulse )
+unit timer_pulse100hz(
+    input   uint1   enable,
+    input   uint1   acknowledge,
+    output  uint1   pulse100hz,
+) <reginputs> {
+    algorithm <autorun> {
+        uint18  counter50mhz = uninitialised;
+        uint1   zero <:: ~|counter50mhz;
+        uint18  counter50mhz_m1 <:: counter50mhz -1 ;
+
+        while(1) {
+            if( enable ) {
+                if( zero ) { pulse100hz = 1; counter50mhz = 500000; } else { counter50mhz = counter50mhz_m1; }
+            } else {
+                counter50mhz = 500000;
+            }
+            if( acknowledge ) { pulse100hz = 0; }
+        }
+    }
+}

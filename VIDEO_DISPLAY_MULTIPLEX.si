@@ -1,0 +1,38 @@
+unit multiplex_display(
+    output! uint8   pix_red,                                                                                                    // 0 - 255 RED
+    output! uint8   pix_green,                                                                                                  // 0 - 255 GREEN
+    output! uint8   pix_blue,                                                                                                   // 0 - 255 BLUE
+
+    input   uint1   V,
+
+    input   uint8   background_pixel,                                                                                                   // BACKGROUND PIXEL
+
+    input   uint8   terminal_pixel,                                                                                                // CHARACTER MAP PIXEL
+    input   uint1   terminal_display,                                                                                          //               DISPLAY?
+) <reginputs> {
+    selectlayer mpd(
+        V <: V,
+        background_pixel <: background_pixel,
+        terminal_pixel <: terminal_pixel,
+        terminal_display <: terminal_display,
+    );
+
+    uint8   BIT3to8[] = { 0, 36, 73, 109, 146, 182, 219, 255 };                                                                 // xxx -> xxxxxxxx
+
+    algorithm <autorun> { while(1) {
+        pix_red = BIT3to8[ { mpd.pixel[6,2], mpd.pixel[0,1]} ];                                                     // DEFAULT RGBM -> R8 G8 B8 via lookup
+        pix_green = BIT3to8[ mpd.pixel[3,3] ];
+        pix_blue = BIT3to8[ { mpd.pixel[1,2], mpd.pixel[0,1]} ];
+    } }
+}
+
+// CHOOSE LAY TO DISPLAY
+unit selectlayer(
+    input   uint1   V,
+    input   uint1   terminal_display,
+    input   uint8   terminal_pixel,
+    input   uint8   background_pixel,
+    output! uint8   pixel
+) <reginputs> {
+    pixel := ( V & terminal_display ) ? terminal_pixel : background_pixel;
+}

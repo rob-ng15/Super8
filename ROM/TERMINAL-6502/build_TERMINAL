@@ -1,0 +1,2 @@
+ca65 --cpu 65c02 -l TERMINAL.list TERMINAL.s
+ld65 -C TERMINAL.cfg -o TERMINAL.bin TERMINAL.o

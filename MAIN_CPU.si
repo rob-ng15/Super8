@@ -1,0 +1,89 @@
+unit memory_main(
+    input   uint1   TIMER_irq,
+
+    output  uint8   out_address,
+    output  uint8   out_data,
+
+    output  uint1   IO_req_write,
+    output  uint1   IO_req_read,
+    input   uint8   IO_in_data,
+
+    output  uint1   TERMINAL_req_write,
+    output  uint1   TERMINAL_req_read,
+    input   uint8   TERMINAL_in_data
+) <reginputs> {
+    $$config['dualport_bram_wmask_byte_wenable0_width'] = 'data'
+    $$config['dualport_bram_wmask_byte_wenable1_width'] = 'data'
+    dualport_bram uint16 ram <"dualport_bram_wmask_byte"> [16384] = uninitialized;                                                // RAM, 0000 - 7fff
+
+    dualport_bram uint16 MOS [2048] = {file("ROM/MAIN-6502/MOS.bin"), pad(uninitialized)};                                      // ROM MOS COMPAT LAYER F000 - ffff
+    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/MAIN-6502/BBC_BASIC4.bin"), pad(uninitialized)};                             // ROM BBC LANGUAGE 8000 - Bfff
+
+//    dualport_bram uint16 MOS [2048] = {file("ROM/SECND/SUPER8-MOS.bin"), pad(uninitialized)};                                      // ROM MOS COMPAT LAYER F000 - ffff
+//    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/SECND/SECND.bin"), pad(uninitialized)};                             // ROM SECND FORTH 8000 - Bfff
+
+//    dualport_bram uint16 ram <"dualport_bram_wmask_byte"> [16384] = {file("ROM/MAIN-6502/6502-TEST/TEST.bin"), pad(uninitialized)};  // RAM 6502-TEST-SUITE, 0000 - 7fff
+//    dualport_bram uint16 MOS [2048] = {file("ROM/MAIN-6502/6502-TEST/SUPER8-MOS.bin"), pad(uninitialized)};                          // ROM MOS COMPAT LAYER F000 - ffff
+//    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/SECND/SECND.bin"), pad(uninitialized)};                                            // ROM SECND FORTH 8000 - Bfff
+
+    CPU6502 CPU(
+        TIMER_irq <: TIMER_irq,
+
+        out_address :> out_address,
+        out_data :> out_data,
+    );
+
+    uint16 wrappage <: ( ( CPU.out_address[0,8] + 2 ) & 8hff ) | ( CPU.out_address[8,8] << 8 );
+
+    ram.addr0 := CPU.out_address[1,15]; ram.addr1 := CPU.out_wrappage ? wrappage[1,15] : CPU.out_address[1,15] + 1;
+    MOS.addr0 := CPU.out_address[1,15]; MOS.addr1 := CPU.out_address[1,15] + 1;
+    LANGUAGE.addr0 := CPU.out_address[1,15]; LANGUAGE.addr1 := CPU.out_address[1,15] + 1;
+
+    ram.wenable0 := 0; ram.wenable1 := 0;
+
+    CPU.mem_busy := CPU.req_read | CPU.req_write; CPU.RUN := 1; CPU.DEBUG := 1;
+    IO_req_read := 0; IO_req_write := 0; TERMINAL_req_read := 0; TERMINAL_req_write := 0;
+
+    algorithm <autorun> { while(1) {
+        switch( CPU.out_address[14,2] ) {
+            default: {
+                CPU.in_data = CPU.out_address[0,1] ? { LANGUAGE.rdata1, LANGUAGE.rdata0[8,8] } : { LANGUAGE.rdata1[0,8], LANGUAGE.rdata0 };
+            }
+            case 2b00: {
+                CPU.in_data = CPU.out_address[0,1] ? { ram.rdata1, ram.rdata0[8,8] } : { ram.rdata1[0,8], ram.rdata0 };
+            }
+            case 2b11: {
+                switch( CPU.out_address[12,2] ) {
+                    case 2b00: { CPU.in_data = IO_in_data; IO_req_read = CPU.req_read; }
+                    case 2b01: { CPU.in_data = TERMINAL_in_data; TERMINAL_req_read = CPU.req_read; }
+                    case 2b10: {}
+                    case 2b11: { CPU.in_data = CPU.out_address[0,1] ? { MOS.rdata1, MOS.rdata0[8,8] } : { MOS.rdata1[0,8], MOS.rdata0 }; }
+                }
+            }
+        }
+
+        if( CPU.req_write ) {
+            switch( CPU.out_address[14,2] ) {
+                case 2b00: {
+                    if( CPU.out_address[0,1] ) {
+                        ram.wdata0 = { CPU.out_data[0,8], 8b0 }; ram.wdata1 = CPU.out_data[8,16];
+                        ram.wenable0 = { CPU.req_mask[0,1], 1b0 }; ram.wenable1 = CPU.req_mask[1,2];
+                    } else {
+                        ram.wdata0 = CPU.out_data[0,16]; ram.wdata1 = { 8b0, CPU.out_data[16,8] };
+                        ram.wenable0 = CPU.req_mask[0,2]; ram.wenable1 = { 1b0, CPU.req_mask[2,1] };
+                    }
+                }
+                case 2b01: {}
+                case 2b10: {}
+                case 2b11: {
+                    switch( CPU.out_address[12,2] ) {
+                        case 2b00: { IO_req_write = 1; }
+                        case 2b01: { TERMINAL_req_write = 1; }
+                        case 2b10: {}
+                        case 2b11: {}
+                    }
+                }
+            }
+        }
+    } }
+}

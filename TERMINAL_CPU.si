@@ -1,0 +1,221 @@
+unit memory_terminal(
+    input   uint1   CLOCK_VIDEO,                                                                                                // 25MHz VGA (640x480@60Hz) clock
+    input   uint1   PULSE_1Hz,
+
+    input   uint9   X,
+    input   uint9   Xp1,
+    input   uint8   Y,
+    input   uint1   B,
+
+    output! uint8   pixel,
+    output! uint1   pixel_display,
+
+    input   uint4   MAIN_in_address,
+    input   uint8   MAIN_in_data,
+    output  uint8   MAIN_out_data,
+    input   uint1   MAIN_req_write,
+    input   uint1   MAIN_req_read,
+) <reginputs> {
+    dualport_bram uint8 terminal_character <@CLOCK_VIDEO,@clock>[$32*24$] = uninitialised;                                      // 32 x 24 character buffer
+    dualport_bram uint8 terminal_foreground <@CLOCK_VIDEO,@clock> [$32*24$] = uninitialised;                                    // 32 x 24 character buffer
+    dualport_bram uint8 terminal_background <@CLOCK_VIDEO,@clock> [$32*24$] = uninitialised;                                    // 32 x 24 character buffer
+    dualport_bram uint5 terminal_attribute <@CLOCK_VIDEO,@clock> [$32*24$] = uninitialised;                                     // 32 x 24 character buffer
+
+    terminal TERMINAL <@CLOCK_VIDEO,!RESET_VIDEO> (
+        clockCG <: clock, PULSE_1Hz <: PULSE_1Hz,
+        X <: X, Xp1 <: Xp1, Y <: Y,
+        pixel :> pixel, pixel_display :> pixel_display,
+
+        terminal_character <:> terminal_character,
+        terminal_foreground <:> terminal_foreground,
+        terminal_background <:> terminal_background,
+        terminal_attribute <:> terminal_attribute,
+    );
+
+    $$config['dualport_bram_wmask_byte_wenable0_width'] = 'data'
+    $$config['dualport_bram_wmask_byte_wenable1_width'] = 'data'
+    dualport_bram uint16 ram <"dualport_bram_wmask_byte"> [256] = uninitialized;                                                // RAM, 0000 - 01ff ( ZP and STACK )
+    dualport_bram uint16 rom [2048] = {file("ROM/TERMINAL-6502/TERMINAL.bin"), pad(uninitialized)};                             // ROM MOS COMPAT LAYER F000 - ffff
+
+
+    CPU6502 TERMINAL_CPU();
+
+    fifo8 TERMINAL_QUEUE( in_data <: MAIN_in_data[0,8], req_write <: MAIN_req_write );
+    uint8   TERMINAL_QUEUE_OUT = uninitialised;
+
+    terminal_character.addr1 := TERMINAL_CPU.out_address; terminal_foreground.addr1 := TERMINAL_CPU.out_address; terminal_background.addr1 := TERMINAL_CPU.out_address; terminal_attribute.addr1 := TERMINAL_CPU.out_address;
+    terminal_character.wdata1 := TERMINAL_CPU.out_data; terminal_foreground.wdata1 := TERMINAL_CPU.out_data; terminal_background.wdata1 := TERMINAL_CPU.out_data; terminal_attribute.wdata1 := TERMINAL_CPU.out_data;
+    terminal_character.wenable1 := 0; terminal_foreground.wenable1 := 0; terminal_background.wenable1 := 0; terminal_attribute.wenable1 := 0;
+
+    ram.addr0 := TERMINAL_CPU.out_address[1,15]; ram.addr1 := TERMINAL_CPU.out_address[1,15] + 1;
+    rom.addr0 := TERMINAL_CPU.out_address[1,15]; rom.addr1 := TERMINAL_CPU.out_address[1,15] + 1;
+
+    ram.wenable0 := 0; ram.wenable1 := 0;
+    TERMINAL_CPU.mem_busy := TERMINAL_CPU.req_read | TERMINAL_CPU.req_write; TERMINAL_CPU.RUN := 1;
+
+    TERMINAL_QUEUE.req_read := 0;
+
+    algorithm <autorun> { while(1) {
+        switch( TERMINAL_CPU.out_address[14,2] ) {
+            default: {
+                // TERMINAL MEMORY
+                switch( TERMINAL_CPU.out_address[10,2] ) {
+                    case 2b00: { TERMINAL_CPU.in_data = terminal_character.rdata1; }
+                    case 2b01: { TERMINAL_CPU.in_data = terminal_foreground.rdata1; }
+                    case 2b10: { TERMINAL_CPU.in_data = terminal_background.rdata1; }
+                    case 2b11: { TERMINAL_CPU.in_data = terminal_attribute.rdata1; }
+                }
+            }
+            case 2b00: {
+                TERMINAL_CPU.in_data = TERMINAL_CPU.out_address[0,1] ? { ram.rdata1, ram.rdata0[8,8] } : { ram.rdata1[0,8], ram.rdata0 };
+            }
+            case 2b11: {
+                switch( TERMINAL_CPU.out_address[12,2] ) {
+                    case 2b00: {
+                        // TERMINAL CONTROL REGISTERS
+                        switch( TERMINAL_CPU.out_address[0,3] ) {
+                            default: {}
+                            case 3h0: { TERMINAL_CPU.in_data = TERMINAL_QUEUE.out_available; }
+                            case 3h1: {
+                                if( TERMINAL_CPU.req_read ) { TERMINAL_QUEUE_OUT = TERMINAL_QUEUE.out_data; TERMINAL_QUEUE.req_read = 1;}
+                                TERMINAL_CPU.in_data = TERMINAL_QUEUE_OUT;
+                            }
+                            case 3h2: { TERMINAL_CPU.in_data = TERMINAL.cursor_x; }
+                            case 3h3: { TERMINAL_CPU.in_data = TERMINAL.cursor_y; }
+                            case 3h4: { TERMINAL_CPU.in_data = TERMINAL.cursor_show; }
+                        }
+                    }
+                    case 2b01: {}
+                    case 2b10: {}
+                    case 2b11: {
+                        TERMINAL_CPU.in_data = TERMINAL_CPU.out_address[0,1] ? { rom.rdata1, rom.rdata0[8,8] } : { rom.rdata1[0,8], rom.rdata0 };
+                    }
+                }
+            }
+        }
+
+        if( TERMINAL_CPU.req_write ) {
+            switch( TERMINAL_CPU.out_address[14,2] ) {
+                case 2b00: {
+                    if( TERMINAL_CPU.out_address[0,1] ) {
+                        ram.wdata0 = { TERMINAL_CPU.out_data[0,8], 8b0 }; ram.wdata1 = TERMINAL_CPU.out_data[8,16];
+                        ram.wenable0 = { TERMINAL_CPU.req_mask[0,1], 1b0 }; ram.wenable1 = TERMINAL_CPU.req_mask[1,2];
+                    } else {
+                        ram.wdata0 = TERMINAL_CPU.out_data[0,16]; ram.wdata1 = { 8b0, TERMINAL_CPU.out_data[16,8] };
+                        ram.wenable0 = TERMINAL_CPU.req_mask[0,2]; ram.wenable1 = { 1b0, TERMINAL_CPU.req_mask[2,1] };
+                    }
+                }
+                case 2b01: {}
+                case 2b10: {
+                    // TERMINAL MEMORY
+                    terminal_character.wenable1 = TERMINAL_CPU.out_address[10,2] == 2b00;
+                    terminal_foreground.wenable1 = TERMINAL_CPU.out_address[10,2] == 2b01;
+                    terminal_background.wenable1 = TERMINAL_CPU.out_address[10,2] == 2b10;
+                    terminal_attribute.wenable1 = TERMINAL_CPU.out_address[10,2] === 2b11;
+                }
+                case 2b11: {
+                    switch( TERMINAL_CPU.out_address[12,2] ) {
+                        case 2b00: {
+                            // TERMINAL CONTROL REGISTERS
+                            switch( TERMINAL_CPU.out_address[0,3] ) {
+                                default: {}
+                                case 3h2: { TERMINAL.cursor_x = TERMINAL_CPU.out_data; }
+                                case 3h3: { TERMINAL.cursor_y = TERMINAL_CPU.out_data; }
+                                case 3h4: { TERMINAL.cursor_show = TERMINAL_CPU.out_data; }
+                            }
+                        }
+                        case 2b01: {}
+                        case 2b10: {}
+                        case 2b11: {}
+                    }
+                }
+            }
+        }
+
+        // HANDLE MAIN CPU READ AND WRITES TO TERMINAL MEMORY
+        switch( MAIN_in_address ) {
+            case 4h0: { MAIN_out_data = TERMINAL_QUEUE.in_full; }
+            case 4h2: { MAIN_out_data = TERMINAL.cursor_x; }
+            case 4h3: { MAIN_out_data = TERMINAL.cursor_y; }
+            case 4h4: { MAIN_out_data = TERMINAL.cursor_show; }
+            default: {}
+        }
+
+        if( MAIN_req_write ) {
+            switch( MAIN_in_address ) {
+                case 4h2: { TERMINAL.cursor_x = MAIN_in_data; }
+                case 4h3: { TERMINAL.cursor_y = MAIN_in_data; }
+                case 4h4: { TERMINAL.cursor_show = MAIN_in_data; }
+                default: {}
+            }
+        }
+
+    } }
+}
+
+unit characterrom512(
+    input   uint1   PULSE_1Hz,
+    input   uint8   character,
+    input   uint3   x,
+    input   uint3   y,
+    input   uint5   attribute,
+    input   uint1   double_right,
+    input   uint1   double_bottom,
+    output! uint1   pixel
+) <reginputs> {
+    brom uint8 characterGenerator8x8[4096] =  {
+        $include('ROM/FONTS/CODE437-THINBOLD.inc')
+        ,pad(uninitialized)
+    };
+
+    // Setup the reading of the characterGenerator8x8 ROM
+    characterGenerator8x8.addr := { attribute[0,1], character, attribute[2,1] ? { double_bottom, y[1,2] } : y };
+    pixel := attribute[3,1] & ~PULSE_1Hz ? 0 :
+             attribute[4,1] & |character & ( ( attribute[2,1] ? { double_bottom, y[1,2] } : y ) == 7 ) ? 1 :
+             characterGenerator8x8.rdata[ attribute[1,1] ? ~{ double_right, x[1,2] } : ~x, 1 ];
+}
+
+unit terminal(
+    dualport_bram_port0 terminal_character,
+    dualport_bram_port0 terminal_foreground,
+    dualport_bram_port0 terminal_background,
+    dualport_bram_port0 terminal_attribute,
+    input   uint1   clockCG,
+
+    input   uint9   X,
+    input   uint9   Xp1,
+    input   uint8   Y,
+    input   uint1   V,
+    input   uint1   B,
+
+    output! uint8   pixel,
+    output! uint1   pixel_display,
+
+    input   uint1   PULSE_1Hz,
+    input   uint1   cursor_show,
+    input   uint5   cursor_x,
+    input   uint5   cursor_y
+) <reginputs> {
+    characterrom512 CGROM <@clockCG> (                                                                                          // Character ROM 8x8 512 characters, 256 normal, 256 bold
+        PULSE_1Hz <: PULSE_1Hz,
+        character <: terminal_character.rdata0,
+        attribute <: terminal_attribute.rdata0,
+        x <: X[0,3],
+        y <: Y[0,3],
+        double_right <: X[3,1],
+        double_bottom <: Y[3,1]
+    );
+
+    uint1   is_cursor <: cursor_show & PULSE_1Hz & ( cursor_x == ( X[3,5] ) ) & ( cursor_y == Y[3,5] );                          // Is cursor and visible?
+
+    terminal_character.addr0 := Xp1[3,5] + { Y[3,5], 5b00000 };
+    terminal_foreground.addr0 := Xp1[3,5] + { Y[3,5], 5b00000 };
+    terminal_background.addr0 := Xp1[3,5] + { Y[3,5], 5b00000 };
+    terminal_attribute.addr0 := Xp1[3,5] + { Y[3,5], 5b00000 };
+
+    pixel_display := ( CGROM.pixel | ( terminal_background.rdata0 != 64 ) | is_cursor );
+    pixel := is_cursor ? CGROM.pixel ? terminal_background.rdata0 :
+                                       terminal_foreground.rdata0 :                                          // IF CURSOR, INVERT PIXEL
+                         CGROM.pixel ? terminal_foreground.rdata0 :                                          // IF PIXEL, FOREGROUND
+                                       terminal_background.rdata0;                                           // ELSE BACKGROUND
+}

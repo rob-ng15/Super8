@@ -1,0 +1,5 @@
+ca65 --cpu 65c02 -l SUPER8-MOS.list SUPER8-MOS.s
+ld65 -C SUPER8-MOS.cfg -o SUPER8-MOS.bin SUPER8-MOS.o
+
+ca65 --cpu 65c02 -l TEST.list -o TEST.o 65C02_extended_opcodes_test.ca65
+ld65 -C TEST.cfg -o TEST.bin TEST.o
