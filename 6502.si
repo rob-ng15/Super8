@@ -16,7 +16,7 @@ unit CPU6502(
     input   uint1   RESET,
     input   uint1   DEBUG
 ) <reginputs> {
-    uint1   IRQ <:: TIMER_irq;
+    uint1   IRQ <:: TIMER_irq & ~SR.SR[2,1];
 
     uint16  VECTORS[3] = uninitialised;                                                                                         // FROM ROM, NMI, RES, IRQ VECTORS
 
@@ -74,7 +74,7 @@ unit CPU6502(
             while( RUN ) {
                 REGISTER = 0; JUMPBRANCH = 0; SR.mask = 0;                                                                      // SET RESULT REGISTER TO A, CLEAR JUMPBRANCH FLAG, FLAGS MASK
                 while( mem_busy ) {} MCODE.latch = 1; ++: ++: ++: ++:                                                           // WAIT FOR FETCH TO FINISH, LATCH INSTRUCTION
-
+                if( DEBUG ) { __write("[FETCH %h]",in_data); }
                 if( MCODE.i_indirect | MCODE.i_actions[1,1] | ( MCODE.i_actions[0,1] & ~MCODE.i_immediate ) ) {                 // IF INDIRECTION OR PULL/8 BIT FETCH REQUIRED
                     if( MCODE.i_indirect ) {                                                                                    // IF INDIRECT FETCH NEW EFFECTIVE ADDRESS
                         out_wrappage = MCODE.i_zp_wrap; out_address = MCODE.i_ea; req_read = 1; while( mem_busy ) {}
@@ -90,6 +90,7 @@ unit CPU6502(
                 }
                 RESULT = VALUE_8;                                                                                               // SET DEFAULT RESULT
 
+                if( DEBUG ) { __display("[PC %h F%b 6502 %h MC %h AM %h (I%b) V8 %h ADDR %h]",PC,SR.SR,{ MCODE.i_6502_high, MCODE.i_6502_low},MCODE.i_mcode,MCODE.i_amode,MCODE.i_indirect,VALUE_8,ADDR); }
                 switch( MCODE.i_mcode[4,4] ) {
                     case 4h0: {                                                                                                 // ARITHMETIC
                         switch( MCODE.i_mcode[0,4] ) {
@@ -198,12 +199,13 @@ unit CPU6502(
 
                 while( mem_busy ) {}                                                                                            // WAIT FOR STORE/PUSH TO FINISH
 
-                if( IRQ & ~SR.SR[2,1] ) {
+                if( IRQ ) {
                     out_address = { 1b1, SPm2 }; out_data = { JUMPBRANCH ? ADDR : PCnext, { SR.SR[5,3], 1b0, SR.SR[0,4] } };    // IRQ, WRITE { PCnext, SR } TO STACK
                     out_wrappage = 1; req_mask = 3b111; req_write = 1;
                     SR.mask = 8b00010100; SR.flags = 8b00000100; SR.update = 1; while( mem_busy ) {}                            //  START PUSH, UPDATE STATUS TO SEI
                     ADDR = VECTORS[2]; JUMPBRANCH = 1;                                                                          //  JUMP TO IRQ VECTOR NOTE
                     REGS[3] = SPm3;                                                                                             // UPDATE STACK
+                    __display("IRQ");
                 }
 
                 out_wrappage = 0; out_address = JUMPBRANCH ? ADDR : PCnext; PC = JUMPBRANCH ? ADDR : PCnext; req_read = 1;      // FETCH NEXT INSTRUCTION

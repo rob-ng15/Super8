@@ -1,44 +1,35 @@
-CHARACTER = $8000                                           ; PAGE FOR CHARACTER MAP
+CHARACTER  = $8000                                          ; PAGE FOR CHARACTER MAP
 FOREGROUND = $8400                                          ; PAGE FOR FOREGROUND MAP
 BACKGROUND = $8800                                          ; PAGE FOR BACKGROUND MAP
-ATTRIBUTE = $8C00                                           ; PAGE FOR ATTRIBUTES
+ATTRIBUTE  = $8C00                                          ; PAGE FOR ATTRIBUTES
 
-terminal_queue_status = $c000
-terminal_queue_in = $c001
-terminal_cursor_x = $c002
-terminal_cursor_y = $c003
-terminal_cursor_on = $c004
-terminal_foreground = $80
-terminal_background = $81
-terminal_attribute = $82
-terminal_new_character = $83
+terminal_queue_status = $c000                               ; I/O REGISTERS     queue availabel?
+terminal_queue_in     = $c001                               ;                   queue entry
+terminal_cursor_x     = $c002                               ;                   where cursor will display x
+terminal_cursor_y     = $c003                               ;                                             y
+terminal_cursor_on    = $c004                               ;                                             on/off
 
-terminal_address_low = $84
-terminal_address_high = terminal_address_low + 1
+terminal_new_character  = $80                               ; ZP    last received character from queue
+terminal_foreground     = $81                               ;       presently requested foreground colour
+terminal_background     = $82                               ;                           background colour
+terminal_attribute      = $83                               ;                           attribute set
 
-scroll_address_low = $85
-scroll_address_high = $86
-scroll_address2_low = $87
-scroll_address2_high = $88
+terminal_address_low    = $84                               ;       16-bit indirect address in character, foreground, background, attribute page
+terminal_address_high   = $85
 
-.segment "STARTUP"
+copy_dest_low           = $86                               ;       16-bit indirect addresses used in copying memory blocks
+copy_dest_high          = $87
+copy_src_low            = $88
+copy_src_high           = $89
+copy_count_low          = $8a                               ;       16-bit counter for number of bytes to copy
+copy_count_high         = $8c
 
+    .segment "STARTUP"                                      ; ENTRY POINT INTO TERMINAL ROM
 ENTRY:
-    sei                                                     ; switch off interrupts
     ldx #$ff                                                ; initialise the stack pointer
     txs
 
     jsr TERMINAL_INIT                                       ; call the terminal initialisation routines
-    bra poll                                                ; jump to the polling loop
-
-
-TERMINAL_POLL_QUEUE:                                        ; wait for a command in the fifo, subroutine so can be used to fetch follow on characters by escape routines
-    lda terminal_queue_status                               ; check FIFO availabale
-    beq TERMINAL_POLL_QUEUE
-    lda terminal_queue_in                                   ; load character
-    sta terminal_new_character                              ; save character
-    rts
-
 
 poll:                                                       ; main terminal loop
     jsr TERMINAL_POLL_QUEUE                                 ; wait for command in the FIFO
@@ -54,7 +45,6 @@ TERMINAL_CONTROL:                                           ; pass to the termin
     jsr TERMINAL_CONTROL_CHARACTER
     bra poll
 
-
 TERMINAL_ESCAPE:
     jsr TERMINAL_ESCAPE_CHARACTER                           ; pass to the terminal escape command handler
     bcs terminal_escape_symbol                              ; if carry set, output the symbol character
@@ -62,6 +52,13 @@ TERMINAL_ESCAPE:
 terminal_escape_symbol:
     jsr TERMINAL_OUTPUT
     bra poll
+
+TERMINAL_POLL_QUEUE:                                        ; wait for a command in the fifo, subroutine so can be used to fetch follow on characters by escape routines
+    lda terminal_queue_status                               ; check FIFO availabale
+    beq TERMINAL_POLL_QUEUE
+    lda terminal_queue_in                                   ; load character
+    sta terminal_new_character                              ; save character
+    rts
 
 
 TERMINAL_OUTPUT:                                            ; output the character ( stored in terminal_new_character )
@@ -100,7 +97,6 @@ move_right:                                                 ; move the cursor ri
 end_line:
     stz terminal_cursor_x
 
-
 move_down:                                                  ; move the cursor down
     lda terminal_cursor_y
     cmp #23                                                 ; at last line?
@@ -108,40 +104,25 @@ move_down:                                                  ; move the cursor do
     inc terminal_cursor_y
     rts
 
-
 TERMINAL_SCROLL:                                            ; scroll the terminal up
-    ldx #0
-sl:
-    lda CHARACTER + 32,x
-    sta CHARACTER,x
-    lda CHARACTER + $100 + 32,x
-    sta CHARACTER + $100,x
-    lda CHARACTER + $200 + 32,x
-    sta CHARACTER + $200,x
+    lda #$80                                                ; set address to 8000 and address2 to 8020 ( last cell of character map, and cell above )
+    jsr TERMINAL_SCROLL_UP_SET_ADDRS
+    jsr MEMCPY_INC
 
-    lda FOREGROUND + 32,x
-    sta FOREGROUND,x
-    lda FOREGROUND + $100 + 32,x
-    sta FOREGROUND + $100,x
-    lda FOREGROUND + $200 + 32,x
-    sta FOREGROUND + $200,x
+; scroll down foreground map
+    lda #$84                                                ; set address to 8200 and address2 to 8220 ( last cell of character map, and cell above )
+    jsr TERMINAL_SCROLL_UP_SET_ADDRS
+    jsr MEMCPY_INC
 
-    lda BACKGROUND + 32,x
-    sta BACKGROUND,x
-    lda BACKGROUND + $100 + 32,x
-    sta BACKGROUND + $100,x
-    lda BACKGROUND + $200 + 32,x
-    sta BACKGROUND + $200,x
+; scroll down background map
+    lda #$88                                                ; set address to 8400 and address2 to 8420 ( last cell of character map, and cell above )
+    jsr TERMINAL_SCROLL_UP_SET_ADDRS
+    jsr MEMCPY_INC
 
-    lda ATTRIBUTE + 32,x
-    sta ATTRIBUTE,x
-    lda ATTRIBUTE + $100 + 32,x
-    sta ATTRIBUTE + $100,x
-    lda ATTRIBUTE + $200 + 32,x
-    sta ATTRIBUTE + $200,x
-
-    inx
-    bne sl
+; scroll down attribute map
+    lda #$8c                                                ; set address to 8600 and address2 to 8620 ( last cell of foreground map, and cell above )
+    jsr TERMINAL_SCROLL_UP_SET_ADDRS
+    jsr MEMCPY_INC
 
     ldx #0                                                  ; set bottom row of screen to 0, foreground, background, attribute
 ssl:
@@ -158,6 +139,18 @@ ssl:
     bne ssl
     rts
 
+TERMINAL_SCROLL_UP_SET_ADDRS:                               ; using A as the base HIGH address, set addresses and counts for scrolling up
+    sta copy_dest_high
+    sta copy_src_high
+    stz copy_dest_low
+    lda #$20
+    sta copy_src_low
+    lda #$02
+    sta copy_count_high
+    lda #$e0
+    sta copy_count_low
+    rts
+
 
 move_left:                                                  ; move the cursor left
     lda terminal_cursor_x
@@ -172,79 +165,31 @@ at_left:
     dec terminal_cursor_y
     rts
 
-
 move_up:                                                    ; move the cursor up
     lda terminal_cursor_y                                   ; at the top of the screen
     beq TERMINAL_SCROLL_DOWN                                ;   call scroll down
     dec terminal_cursor_y
     rts
 
-
 TERMINAL_SCROLL_DOWN:
     lda #$82                                                ; set address to 82ff and address2 to 82df ( last cell of character map, and cell above )
-    sta scroll_address_high
-    sta scroll_address2_high
-    lda #$ff
-    sta scroll_address_low
-    lda #$df
-    sta scroll_address2_low
-csdl:
-    lda (scroll_address2_low)                               ; scroll down character map
-    sta (scroll_address_low)
-    jsr DEC_ADDRS
-    lda scroll_address2_high                                ; loop if not copied top line
-    cmp #$7f
-    bne csdl
+    jsr TERMINAL_SCROLL_DOWN_SET_ADDRS
+    jsr MEMCPY_DEC
 
 ; scroll down foreground map
     lda #$86                                                ; set address to 86ff and address2 to 86df ( last cell of foreground map, and cell above )
-    sta scroll_address_high
-    sta scroll_address2_high
-    lda #$ff
-    sta scroll_address_low
-    lda #$df
-    sta scroll_address2_low
-fsdl:
-    lda (scroll_address2_low)                               ; scroll down character map
-    sta (scroll_address_low)
-    jsr DEC_ADDRS
-    lda scroll_address2_high                                ; loop if not copied top line
-    cmp #$83
-    bne fsdl
+    jsr TERMINAL_SCROLL_DOWN_SET_ADDRS
+    jsr MEMCPY_DEC
 
 ; scroll down background map
     lda #$8a                                                ; set address to 8aff and address2 to 8adf ( last cell of foreground map, and cell above )
-    sta scroll_address_high
-    sta scroll_address2_high
-    lda #$ff
-    sta scroll_address_low
-    lda #$df
-    sta scroll_address2_low
-dsdl:
-    lda (scroll_address2_low)                               ; scroll down character map
-    sta (scroll_address_low)
-    jsr DEC_ADDRS
-    lda scroll_address2_high                                ; loop if not copied top line
-    cmp #$87
-    bne dsdl
-
+    jsr TERMINAL_SCROLL_DOWN_SET_ADDRS
+    jsr MEMCPY_DEC
 
 ; scroll down attribute map
     lda #$8e                                                ; set address to 8eff and address2 to 8edf ( last cell of foreground map, and cell above )
-    sta scroll_address_high
-    sta scroll_address2_high
-    lda #$ff
-    sta scroll_address_low
-    lda #$df
-    sta scroll_address2_low
-asdl:
-    lda (scroll_address2_low)                               ; scroll down character map
-    sta (scroll_address_low)
-    jsr DEC_ADDRS
-    lda scroll_address2_high                                ; loop if not copied top line
-    cmp #$8b
-    bne asdl
-
+    jsr TERMINAL_SCROLL_DOWN_SET_ADDRS
+    jsr MEMCPY_DEC
 
     ldx #$0
 ssdl:
@@ -262,31 +207,49 @@ ssdl:
 
     rts
 
+TERMINAL_SCROLL_DOWN_SET_ADDRS:                             ; using A as the base HIGH address, set addresses and counts for scrolling down
+    sta copy_dest_high
+    sta copy_src_high
+    lda #$ff
+    sta copy_dest_low
+    lda #$df
+    sta copy_src_low
+    lda #$02
+    sta copy_count_high
+    lda #$e0
+    sta copy_count_low
+    rts
+
 
 TERMINAL_CLEAR:
-    ldx #0
-tcl:
-    stz  CHARACTER,x
-    stz  CHARACTER+$100,x
-    stz  CHARACTER+$200,x
+    lda #>CHARACTER
+    jsr TERMINAL_CLEAR_SET_ADDRS
+    lda #$00
+    jsr MEMSET
 
+    lda #>FOREGROUND
+    jsr TERMINAL_CLEAR_SET_ADDRS
     lda terminal_foreground
-    sta FOREGROUND,x
-    sta FOREGROUND+$100,x
-    sta FOREGROUND+$200,x
+    jsr MEMSET
 
+    lda #>BACKGROUND
+    jsr TERMINAL_CLEAR_SET_ADDRS
     lda terminal_background
-    sta BACKGROUND,x
-    sta BACKGROUND+$100,x
-    sta BACKGROUND+$200,x
+    jsr MEMSET
 
+    lda #>ATTRIBUTE
+    jsr TERMINAL_CLEAR_SET_ADDRS
     lda terminal_attribute
-    sta ATTRIBUTE,x
-    sta ATTRIBUTE+$100,x
-    sta ATTRIBUTE+$200,x
+    jsr MEMSET
 
-    inx
-    bne tcl
+    rts
+
+TERMINAL_CLEAR_SET_ADDRS:                             ; using A as the base HIGH address, set addresses and counts for scrolling down
+    sta copy_dest_high
+    stz copy_dest_low
+    lda #$03
+    sta copy_count_high
+    stz copy_count_low
     rts
 
 
@@ -324,7 +287,6 @@ TB_LOOP:
     cpx #$40
     bne TB_LOOP
     rts
-
 
 STARTUP_BANNER:
 SB_TEXT:
@@ -370,10 +332,10 @@ CONTROL_CHARACTER_JUMP_TABLE:
     .word   UNHANDLED_CONTROL_CHARACTER
     .word   UNHANDLED_CONTROL_CHARACTER
     .word   UNHANDLED_CONTROL_CHARACTER
-    .word   move_left
-    .word   move_right
-    .word   move_down
-    .word   move_up
+    .word   move_left                                       ; use standard left routine, handles moving lines and scrolling down
+    .word   move_right                                      ; use standard right routine, handles moving lines and scrolling up
+    .word   move_down                                       ; use standard down routine, handles scrolling up
+    .word   move_up                                         ; use standard up rotuine, handles scrolling down
     .word   TERMINAL_CLEAR
     .word   CONTROL_CHARACTER_0D
     .word   UNHANDLED_CONTROL_CHARACTER
@@ -397,16 +359,16 @@ CONTROL_CHARACTER_JUMP_TABLE:
 
 
 TERMINAL_ESCAPE_CHARACTER:
-    and #$0f
-    asl a
-    tax
-    jsr TERMINAL_POLL_QUEUE
-    jmp (ESCAPE_CHARACTER_JUMP_TABLE,x)
+    and #$0f                                                ; extract lower nibble
+    asl a                                                   ; double it
+    tax                                                     ; copy to x
+    jsr TERMINAL_POLL_QUEUE                                 ; get next character, stored in terminal_new_character and A
+    clc                                                     ; clear the carry flag to indicate handled
+    jmp (ESCAPE_CHARACTER_JUMP_TABLE,x)                     ; jump to the escape character control routine
 
 ESCAPE_CHARACTER_00:                                        ; set x cursor, snap to 0 - 31
     and #$1f
     sta terminal_cursor_x
-    clc
     rts
 ESCAPE_CHARACTER_01:                                        ; set y cursor, snap to 0 - 23
     cmp #$17
@@ -415,55 +377,41 @@ ESCAPE_CHARACTER_01:                                        ; set y cursor, snap
     lda #$17
 ES_01_SET:
     sta terminal_cursor_y
-    clc
     rts
 ESCAPE_CHARACTER_02:                                        ; set foreground colour
     sta terminal_foreground
-    clc
     rts
 ESCAPE_CHARACTER_03:                                        ; set background colour
     sta terminal_background
-    clc
     rts
 ESCAPE_CHARACTER_04:                                        ; set attribute by bitmap
-    and #$1f
-    ora terminal_attribute
-    sta terminal_attribute
-    clc
+    and #$1f                                                ; mask lower 5 bits
+    ora terminal_attribute                                  ; or with present attributes
+    sta terminal_attribute                                  ; store new attributes
     rts
 ESCAPE_CHARACTER_05:                                        ; clear attribute by bitmap ( #$1f will set to normal text )
-    eor #$ff
-    and #$1f
-    and terminal_attribute
-    sta terminal_attribute
-    clc
+    eor #$ff                                                ; invert the bits
+    and #$1f                                                ; select lower 5 bits
+    and terminal_attribute                                  ; and with present attributes
+    sta terminal_attribute                                  ; store new attributes
     rts
 ESCAPE_CHARACTER_06:
-    clc
     rts
 ESCAPE_CHARACTER_07:
-    clc
     rts
 ESCAPE_CHARACTER_08:
-    clc
     rts
 ESCAPE_CHARACTER_09:
-    clc
     rts
 ESCAPE_CHARACTER_0A:
-    clc
     rts
 ESCAPE_CHARACTER_0B:
-    clc
     rts
 ESCAPE_CHARACTER_0C:
-    clc
     rts
 ESCAPE_CHARACTER_0D:
-    clc
     rts
 ESCAPE_CHARACTER_0E:
-    clc
     rts
 ESCAPE_CHARACTER_0F:
     sec                                                     ; set carry flag so as to output character symbol
@@ -501,6 +449,7 @@ X32_loop:
     plx
     rts
 
+
 ADDR_NEXT_PAGE:                                             ; add $400 to move from character -> foreground -> background -> attribute pages
     php
     pha
@@ -513,19 +462,78 @@ ADDR_NEXT_PAGE:                                             ; add $400 to move f
     rts
 
 
-DEC_ADDRS:                                                  ; decrement the scrolling addresses
-    pha
-    lda scroll_address_low                                  ; decrement address
-    bne lowdne0
-    dec scroll_address_high
-lowdne0:
-    dec scroll_address_low
+MEMCPY_INC:                                                 ; MEMCPY incrementing addresses
+    lda (copy_src_low)
+    sta (copy_dest_low)
+    jsr INC_ADDRS
+    jsr DEC_COUNT
+    bcc MEMCPY_INC
+    rts
 
-    lda scroll_address2_low                                 ; decremnt address2
+MEMCPY_DEC:                                                 ; MEMCPY decrementing addresses
+    lda (copy_src_low)
+    sta (copy_dest_low)
+    jsr DEC_ADDRS
+    jsr DEC_COUNT
+    bcc MEMCPY_DEC
+    rts
+
+MEMSET:                                                     ; MEMSET to value in A
+    sta (copy_dest_low)
+    jsr INC_ADDRS
+    jsr DEC_COUNT
+    bcc MEMSET
+    rts
+
+DEC_ADDRS:                                                  ; decrement the copy addresses
+    pha
+    lda copy_dest_low                                       ; decrement dest
+    bne lowdne0
+    dec copy_dest_high
+lowdne0:
+    dec copy_dest_low
+    lda copy_src_low                                        ; decremnt src
     bne low2dne0
-    dec scroll_address2_high
+    dec copy_src_high
 low2dne0:
-    dec scroll_address2_low
+    dec copy_src_low
+    pla
+    rts
+
+INC_ADDRS:                                                  ; increment the copy addresses
+    pha
+    lda copy_dest_low                                       ; increment dest
+    cmp #$ff
+    bne lowneff
+    inc copy_dest_high
+lowneff:
+    inc copy_dest_low
+
+    lda copy_src_low                                        ; increment src
+    cmp #$ff
+    bne low2neff
+    inc copy_src_high
+low2neff:
+    inc copy_src_low
+    pla
+    rts
+
+
+DEC_COUNT:                                                  ; DECREMENT THE COPY COUNT
+    pha
+    lda copy_count_low
+    bne clowdne0
+    dec copy_count_high
+clowdne0:
+    dec copy_count_low
+
+    clc                                                     ; CLEAR CARRY, SET IF COUNT == 0
+    lda copy_count_high                                     ; CHECK HIGH == 0
+    bne dec_count_exit
+    lda copy_count_low                                      ;   AND LOW == 0
+    bne dec_count_exit
+    sec                                                     ; SET CARRY, COPY FINISHED
+dec_count_exit:
     pla
     rts
 

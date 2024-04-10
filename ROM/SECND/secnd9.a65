@@ -55,8 +55,13 @@ SCRATCH    = $0010  ; through to $001F (adopted from monitor)
 PRINTVEC   = $0042  ; and 0043 (borrowed from monitor)
 
 ;; MOS VECTORS
-PUTA = $FF00
-GETA = $FF03
+PUTA = $FFEE
+GETA = $FFE0
+OSKBD1 =$18
+OSKBD2 =OSKBD1+1
+OSKBD3 =OSKBD1+2
+READBUFFER      = OSKBD1  ; this stores the latest ASCII character that was sent into the ACIA
+KEYBOARD_FLAGS  = OSKBD2  ; This byte helps us keep track of the state of a key presses on the keyboard. See below.
 
 ;;; MEMORY MAP
 ;;;
@@ -4288,7 +4293,7 @@ dokey
 dokeyqu
   dex
   dex
-  lda $c002
+  lda READBUFFER
   beq nokey
   jmp settrue
 nokey
