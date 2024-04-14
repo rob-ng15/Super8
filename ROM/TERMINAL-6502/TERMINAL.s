@@ -451,38 +451,50 @@ X32_loop:
 
 
 ADDR_NEXT_PAGE:                                             ; add $400 to move from character -> foreground -> background -> attribute pages
-    php
-    pha
     clc
     lda terminal_address_high
     adc #$04
     sta terminal_address_high
-    pla
-    plp
     rts
 
-
 MEMCPY_INC:                                                 ; MEMCPY incrementing addresses
+    lda copy_count_low                                      ; check count != 0
+    ora copy_count_high
+    beq MEMCPY_INC_EXIT
+MEMCPY_INC_LOOP:
     lda (copy_src_low)
     sta (copy_dest_low)
     jsr INC_ADDRS
     jsr DEC_COUNT
-    bcc MEMCPY_INC
+    bcc MEMCPY_INC_LOOP
+MEMCPY_INC_EXIT:
     rts
 
 MEMCPY_DEC:                                                 ; MEMCPY decrementing addresses
+    lda copy_count_low                                      ; check count != 0
+    ora copy_count_high
+    beq MEMCPY_DEC_EXIT
+MEMCPY_DEC_LOOP:
     lda (copy_src_low)
     sta (copy_dest_low)
     jsr DEC_ADDRS
     jsr DEC_COUNT
-    bcc MEMCPY_DEC
+    bcc MEMCPY_DEC_LOOP
+MEMCPY_DEC_EXIT:
     rts
 
 MEMSET:                                                     ; MEMSET to value in A
+    pha
+    lda copy_count_low                                      ; check count != 0
+    ora copy_count_high
+    beq MEMSET_EXIT
+    pla
+MEMSET_LOOP:
     sta (copy_dest_low)
     jsr INC_ADDRS
     jsr DEC_COUNT
-    bcc MEMSET
+    bcc MEMSET_LOOP
+MEMSET_EXIT:
     rts
 
 DEC_ADDRS:                                                  ; decrement the copy addresses
@@ -518,8 +530,7 @@ low2neff:
     pla
     rts
 
-
-DEC_COUNT:                                                  ; DECREMENT THE COPY COUNT
+DEC_COUNT:                                                  ; DECREMENT THE COPY COUNT ( sets carry if count == 0 )
     pha
     lda copy_count_low
     bne clowdne0

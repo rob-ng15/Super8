@@ -4,6 +4,8 @@
 ; by Chelsea Wilkinson (chelsea6502)
 ; https://github.com/chelsea6502/BeebEater
 
+; FOR SECND, only free ZP area is 00-0f,20-2f
+
 ; -- Constants --
 
 ; First, let's set some addresses...
@@ -12,18 +14,20 @@ START = $F000 ; the entry point for BeebEater.
 
 ; We're going to use the same constant names from the original BBC Micro/Master OS (a.k.a 'BBC MOS').
 ; See https://mdfs.net/Docs/Comp/BBC/AllMem for details.
-OSVDU  =$D0
-OSKBD1 =$EC
+OSVDU  =$00
+OSKBD1 =$18
 OSKBD2 =OSKBD1+1
 OSKBD3 =OSKBD1+2
-OSAREG =$EF
-OSXREG =$F0
-OSYREG =$F1
-OSINTA =$FC
-OSFAULT=$FD
-OSESC  =$FF
-TIME   =$0292 ; A 5-byte memory location ($0292-$0296) that counts the number of 'centiseconds' since booting up. We use this for the TIME function.
-OSVDUWS=$0300
+OSAREG =$20
+OSXREG =$21
+OSYREG =$22
+OSINTA =$23
+OSINTX =$24
+OSINTY =$25
+OSFAULT=$2e
+OSESC  =$2F
+TIME   =$03 ; A 5-byte memory location ($0292-$0296) that counts the number of 'centiseconds' since booting up. We use this for the TIME function.
+OSVDUWS=$02
 
 ; For some, we'll set some aliases so it's easier to understand their purpose.
 READBUFFER      = OSKBD1  ; this stores the latest ASCII character that was sent into the ACIA
@@ -34,11 +38,9 @@ UART_OUT_status = $c000
 UART_OUT        = $c001
 UART_IN_status  = $c002
 UART_IN         = $c003
-UART_RESET      = $c004
 
 PS2_IN_status   = $c010
 PS2_IN          = $c011
-PS2_RESET       = $c012
 
 TIMER_IRQ       = $c020
 TIMER_IRQ_EN    = $c021
@@ -82,7 +84,7 @@ bootMessage:
     .byte "from BeebEater MOS"
     .byte $0D
     .byte "32K RAM " ; 16k for 16 kilobytes of RAM available. Feel free to change it if you change your RAM capacity.
-    .byte $84,$01,"65c02 BBC BASIC",$85,$1f
+    .byte $84,$01,"65c02 SECND",$85,$1f
     .byte $0A ; Give a one-line gap.
     .byte $0D
     .byte $07 ; Send a bell character
@@ -100,19 +102,9 @@ reset:
     STZ TIME + 3
     STZ TIME + 4
 
-    ; Reset UART AND PS2 QUEUES
-    STZ UART_RESET
-    STZ PS2_RESET
-
     ; Initialise KEYBOARD_FLAGS to 0
     STZ READBUFFER
     STZ KEYBOARD_FLAGS
-
-    ; To print characters, BBC BASIC uses the address stored in $020F-$020E. We need to load those addresses with our OSWRCH routine.
-    LDA #>OSWRCHV ; Get the high byte of the write character routine.
-    STA $020F ; Store it in $020F.
-    LDA #<OSWRCHV ; Get the low byte of the write character routine.
-    STA $020E ; Store it in $020E
 
     ; -- Print the boot message --
 
@@ -435,10 +427,6 @@ keymap_shifted:
 ; Subroutine called after every NMI or IRQ in hardware, or the BRK instruction in software.
 interrupt:
     STA OSINTA ; Save A for later.
-    PLA ; Get the status register. IRQ/BRK puts it on the stack.
-    PHA ; Keep the status register on the stack for later.
-    AND #$10 ; Check if it's a BRK or an IRQ.
-    BNE BRKV ; If it's BRK, that's an error. Go to the BRK vector.
 
     BIT TIMER_IRQ_ACK       ; ACKNOWLEDGE THE TIMER INTERRUPT
     lda READBUFFER          ; check if basic has cleared readbuffer
@@ -472,26 +460,6 @@ irq_via_tick: ; If we've ruled out the ACIA & keyboard, then let's assume it was
 end_irq:
     LDA OSINTA ; Restore A
     RTI ; "ReTurn from Interrupt" Restore caller's flags, return to caller.
-
-; -- BREAK Handler --
-
-; Handler for interrupts that we know were called by the BRK instruction. This means an error was reported.
-; The BBC MOS API defines the structure of an error message. To get the message, we need to store the location of the error message in addresses $FD and $FE.
-BRKV:
-    PHX                 ; Save X
-    TSX                 ; Get the stack pointer value
-    LDA $0103,X         ; Get the low byte of the error message location, offset by the stack pointer.
-    SEC
-    SBC #1               ; Subtract one, as BRK stores BRK+2 to the stack by default, rather than the BRK+1 that we need.
-    STA OSFAULT         ; Store the low byte into the fault handler.
-    LDA $0104,X         ; Get the high byte of the error message location.
-    SBC #0              ; Did subtracting 1 from the low byte cause the carry bit to set? Subtract 1 from the high byte too.
-    STA OSFAULT+1       ; Store the high byte into the fault handler.
-    STX OSXREG          ; Store the location of the last break for the error handler.
-    PLX                 ; Restore X
-    LDA OSINTA
-    CLI
-    JMP ($0202)         ; Jump to BBC BASIC's error handler routine, which takes it from there. Address $0202 points to the routine.
 
     ; BBC MOS system calls. Code call these by jumping to their place in memory.
     ; Most of them jump to a 'vector' that properly handles the system call.

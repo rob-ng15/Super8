@@ -16,23 +16,13 @@ unit CPU6502(
     input   uint1   RESET,
     input   uint1   DEBUG
 ) <reginputs> {
-    uint1   IRQ <:: TIMER_irq & ~SR.SR[2,1];
+    uint1   IRQ <:: TIMER_irq & ~SR.SR[2,1];                                                                                    // IRQ REQUEST AND IRQ ENABLED
 
-    uint16  VECTORS[3] = uninitialised;                                                                                         // FROM ROM, NMI, RES, IRQ VECTORS
-
-    uint16  PC = uninitialised; uint16  PCnext <:: PC + MCODE.i_length;                                                         // PC AND PC FOR FOLLOWING INSTRUCTION (no jump/branch)
-    uint16  PCjsr <:: PC + 2;                                                                                                   // PC TO PUSH TO STACK FOR JSR
-    uint16  PCrts <:: in_data[0,16] + 1;
-    uint16  PCbrx <:: PCnext + { {8{MCODE.value_16[15,1]}}, MCODE.value_16[8,8] };
+    uint16  PC = uninitialised;                                                                                                 // PC
     uint8   REGS[4] = { 0, 0, 0, 0 };                                                                                           // { SP Y X A }
-    uint8   SPm1 <:: REGS[3] - 1; uint8   SPm2 <:: REGS[3] - 2; uint8   SPm3 <:: REGS[3] - 3;                                   // STACK OFFSETS    PUSH
-    uint8   SPp1 <:: REGS[3] + 1; uint8   SPp2 <:: REGS[3] + 2; uint8   SPp3 <:: REGS[3] + 3;                                   //                  PULL
 
     uint16  ADDR = uninitialised;
     uint8   VALUE_8 = uninitialised;
-    uint1   JUMPBRANCH = uninitialised;
-    uint9   RESULT = uninitialised;                                                                                             // RESULT, 1 EXTRA BIT FOR UNDERFLOW / OVERFLOW
-    uint2   REGISTER = uninitialised;
 
     microcode_6502 MCODE( fetch <: in_data, X <: REGS[1], Y <: REGS[2], PC <: PC );                                             // CONVERT 6502 INSTRUCTIONS to MCODE opcode, address mode, etc
     sr_6502 SR();                                                                                                               // 6502 STATUS REGISTER
@@ -60,155 +50,228 @@ unit CPU6502(
     req_read := 0; req_write := 0; MCODE.latch := 0; SR.update := 0;                                                            // HOLD MEMORY FLAGS AND LATCHES AT 0
 
     algorithm <autorun> {
-        uint16  resetCounter = -1;                                                                                              // RESET COUNTER
-        uint16  resetNEXT <:: resetCounter - ~( mem_busy );                                                                     // -1 WHEN ALL UNITS READY
-        while( |resetCounter ) { resetCounter = resetNEXT; }                                                                    // DELAY STARTUP
+        uint10  STATE = 1;                                                                                                      // FSM FOR CPU LOOP AND STATES
+            $$ STATE_FETCH      = 1
+            $$ STATE_TO_MCODE   = 2
+            $$ STATE_INDIRECT   = 4
+            $$ STATE_FETCH_8    = 8
+            $$ STATE_ASSIGN     = 16
+            $$ STATE_EXECUTE    = 32
+            $$ STATE_WRITE_8    = 64
+            $$ STATE_COMMIT     = 128
+            $$ STATE_IRQ_REQ    = 256
+            $$ STATE_NEXT_ISN   = 512
 
-        out_wrappage = 0;
-        out_address = 16hFFFA; req_read = 1; while( mem_busy ) {} VECTORS[0] = in_data[0,16];                                   // FETCH NMI VECTOR
-        out_address = 16hFFFE; req_read = 1; while( mem_busy ) {} VECTORS[2] = in_data[0,16];                                   // FETCH IRQ VECTOR
-        out_address = 16hFFFC; req_read = 1; while( mem_busy ) {} VECTORS[1] = in_data[0,16];                                   // FETCH RESET VECTOR
-        PC = in_data[0,16]; out_address = in_data[0,16]; req_read = 1;                                                          // FETCH FIRST INSTRUCTION
+        uint1   START = 0;                                                                                                      // HOLD UNTIL VECTORS HAVE BEEN READ
+        uint16  VECTORS[3] = uninitialised;                                                                                     // FROM ROM, NMI, RES, IRQ VECTORS
+        uint2   VECTOR = 0;                                                                                                     // VECTOR BEING READ
+        uint2   VECTOR_NEXT <:: VECTOR + 1;                                                                                     //  +1 WHEN VECTOR READ
+        uint16  VECTOR_ADDRESS[3] = { 16hFFFA, 16hFFFC, 16hFFFE };                                                              // NMI, RESET, IRQ
+        uint3   RESET_STATE = 1;                                                                                                // FSM FOR RESET PROCESS AND STATES
+            $$ RESET_DELAY      = 1
+            $$ RESET_VECTOR_GET = 2
+            $$ RESET_VECTOR_PUT = 4
+
+        uint8   resetCounter = -1;                                                                                              // RESET COUNTER
+        uint8   resetNEXT <:: resetCounter - ~( mem_busy );                                                                     //  -1 WHEN ALL UNITS READY
+
+        uint16  PCnext <:: PC + MCODE.i_length;                                                                                 // PC FOR FOLLOWING INSTRUCTION (no jump/branch)
+        uint16  PCjsr <:: PC + 2;                                                                                               // PC TO PUSH TO STACK FOR JSR
+        uint16  PCrts <:: in_data[0,16] + 1;                                                                                    // PC FOR RTS, ADD 1 TO STACK ADDRESS
+        uint16  PCbrx <:: PCnext + { {8{MCODE.value_16[15,1]}}, MCODE.value_16[8,8] };                                          // PC BRANCH FOR BBRx BBSx INSTRUCTIONS
+
+        uint8   SPm1 <:: REGS[3] - 1; uint8   SPm2 <:: REGS[3] - 2; uint8   SPm3 <:: REGS[3] - 3;                               // STACK OFFSETS    PUSH
+        uint8   SPp1 <:: REGS[3] + 1; uint8   SPp2 <:: REGS[3] + 2; uint8   SPp3 <:: REGS[3] + 3;                               //                  PULL
+
+        while( ~START ) {
+            onehot( RESET_STATE ) {
+                case 0: {                                                                                                       // DELAY STARTUP
+                    if( |resetCounter ) { resetCounter = resetNEXT; } else { RESET_STATE = $RESET_VECTOR_GET$; }
+                }
+                case 1: {                                                                                                       // FETCH VECTOR OR START CPU
+                    if( ~&VECTOR ) {
+                        out_address = VECTOR_ADDRESS[ VECTOR ]; req_read = 1;                                                   //  START FETCH FROM VECTOR
+                        RESET_STATE = $RESET_VECTOR_PUT$;
+                    } else {
+                        PC = VECTORS[1]; out_address = VECTORS[1]; req_read = 1;                                                //  START FETCH OF FIRST INSTRUCTION
+                        START = 1;                                                                                              //  EXIT RESET STATE
+                    }
+                }
+                case 2: {                                                                                                       // STORE VECTOR
+                    if( ~mem_busy ) {
+                        VECTORS[ VECTOR ] = in_data[0,16]; VECTOR = VECTOR_NEXT;                                                //  STORE VECTOR AND MOVE TO NEXT VECTOR
+                        RESET_STATE = $RESET_VECTOR_GET$;
+                    }
+                }
+            }
+        }
 
         while(1) {
-            while( RUN ) {
-                REGISTER = 0; JUMPBRANCH = 0; SR.mask = 0;                                                                      // SET RESULT REGISTER TO A, CLEAR JUMPBRANCH FLAG, FLAGS MASK
-                while( mem_busy ) {} MCODE.latch = 1; ++: ++: ++: ++:                                                           // WAIT FOR FETCH TO FINISH, LATCH INSTRUCTION
-                if( DEBUG ) { __write("[FETCH %h]",in_data); }
-                if( MCODE.i_indirect | MCODE.i_actions[1,1] | ( MCODE.i_actions[0,1] & ~MCODE.i_immediate ) ) {                 // IF INDIRECTION OR PULL/8 BIT FETCH REQUIRED
-                    if( MCODE.i_indirect ) {                                                                                    // IF INDIRECT FETCH NEW EFFECTIVE ADDRESS
-                        out_wrappage = MCODE.i_zp_wrap; out_address = MCODE.i_ea; req_read = 1; while( mem_busy ) {}
-                    }
-                    out_wrappage = 0; ADDR = ( MCODE.i_indirect ? in_data[0,16] : MCODE.i_ea ) + MCODE.i_ea_offset;             // SET EFFECTIVE ADDRESS INDIRECT OR FROM MICROCODE
-                    if( MCODE.i_actions[1,1] | ( MCODE.i_actions[0,1] & ~MCODE.i_immediate ) ) {                                // FETCH 8 BIT VALUE_8 OR PULL FROM STACK
-                        out_wrappage = MCODE.i_actions[1,1]; out_address = MCODE.i_actions[1,1] ? { 1b1, SPp1 } : ADDR;         //  WRAP IF PULL FROM STACK
-                        req_read = 1; while( mem_busy ) {}  VALUE_8 = in_data[0,8];
-                    }
-                } else {
-                    ADDR = MCODE.i_ea + MCODE.i_ea_offset;                                                                      // USE ADDRESS DIRECTLY
-                    VALUE_8 = MCODE.value_8;                                                                                    // USE IMMEDIATE VALUE
-                }
-                RESULT = VALUE_8;                                                                                               // SET DEFAULT RESULT
+            uint2   DELAY = uninitialised;                                                                                      // DELAY COUNTER TO ALLOW 6502 -> MCODE
+            uint1   JUMPBRANCH = uninitialised;                                                                                 // JUMPBRANCH == 0 NEXT ISN, == 1 FOLLOW JUMP/BRANCH
+            uint2   REGISTER = uninitialised;                                                                                   // REGISTER FOR RESULT
+            uint9   RESULT = uninitialised;                                                                                     // RESULT, 1 EXTRA BIT FOR UNDERFLOW / OVERFLOW
 
-                if( DEBUG ) { __display("[PC %h F%b 6502 %h MC %h AM %h (I%b) V8 %h ADDR %h]",PC,SR.SR,{ MCODE.i_6502_high, MCODE.i_6502_low},MCODE.i_mcode,MCODE.i_amode,MCODE.i_indirect,VALUE_8,ADDR); }
-                switch( MCODE.i_mcode[4,4] ) {
-                    case 4h0: {                                                                                                 // ARITHMETIC
-                        switch( MCODE.i_mcode[0,4] ) {
-                            case 4h1: { RESULT = ADD.RESULT; SR.mask = 8b11000011; SR.flags = ADD.SR; }                         //  ADC
-                            case 4h2: { RESULT = SUB.RESULT; SR.mask = 8b11000011; SR.flags = SUB.SR; }                         //  SBC
-                            case 4h3: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                         //  AND, SET NZ FLAGS
-                            case 4h4: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                         //  EOR, SET NZ FLAGS
-                            case 4h5: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                         //  OR, SET NZ FLAGS
-                            case 4h6: { RESULT = ASL.RESULT; SR.mask = 8b10000011; SR.flags = ASL.SR; }                         //  ASL, SET NZC FLAGS
-                            case 4h7: { RESULT = LSR.RESULT; SR.mask = 8b10000011; SR.flags = LSR.SR; }                         //  LSR, SET NZC FLAGS
-                            case 4h8: { RESULT = ROL.RESULT; SR.mask = 8b10000011; SR.flags = ROL.SR; }                         //  ROL, SET NZC FLAGS
-                            case 4h9: { RESULT = ROR.RESULT; SR.mask = 8b10000011; SR.flags = ROR.SR; }                         //  ROR,SET NZC FLAGS
-                            case 4ha: {                                                                                         //  BIT
-                                SR.mask = MCODE.i_immediate ? 8b00000010 : 8b11000010;                                          //      ( 65c02 ) IMM MODE ONLY AFFECTS Z FLAG
-                                SR.flags = { VALUE_8[6,2], 4b0000, ~|( VALUE_8 & REGS[0] ), 1b0 };                              //      SET N = bit 7, V = bit 6, AND Z FLAGS
+            onehot( STATE ) {
+                case 0: {                                                                                                       // SET INITIAL STATE, WAIT FOR FETCH TO FINISH
+                    if( ~mem_busy ) {                                                                                           //  WAIT FOR FETCH TO FINISH
+                        REGISTER = 0; JUMPBRANCH = 0;                                                                           //  RESULT REGISTER TO A, NO JUMPBRANCH
+                        MCODE.latch = 1; DELAY = -1;                                                                            //  STORE THE INSTRUCTION
+                        STATE = $STATE_TO_MCODE$;
+                    }
+                }
+                case 1: {                                                                                                       // 65c02 -> MCODE, FETCH INDIRECT ADDRESS
+                    if( |DELAY ) {
+                        DELAY = DELAY >> 1;
+                    } else {
+                        VALUE_8 = MCODE.value_8; ADDR = MCODE.i_ea + MCODE.i_ea_offset;                                         //  ASSIGN VALUE_8 AND ADDR FROM FETCH
+
+                        STATE =                                                     MCODE.i_indirect ? $STATE_INDIRECT$ :       //  JUMP TO INDIRECT ADDRESS REQUIRED
+                                MCODE.i_actions[1,1] | ( MCODE.i_actions[0,1] & ~MCODE.i_immediate ) ? $STATE_FETCH_8$ :        //  JUMP TO PULL OR 8-BIT FETCH REQUIRED
+                                                                                                       $STATE_EXECUTE$;         //  JUMP TO EXECUTE AS USING FETCH VALUES
+                        out_wrappage = MCODE.i_zp_wrap; out_address = MCODE.i_ea; req_read = MCODE.i_indirect;                  //  START FETCH OF INDIRECT ADDRESS
+                    }
+                }
+                case 2: {                                                                                                       // 8-BIT FETCH FOM INDIRECT ADDRESS REQUIRED?
+                    STATE = MCODE.i_actions[1,1] | ( MCODE.i_actions[0,1] & ~MCODE.i_immediate ) ? $STATE_FETCH_8$ :            //  YES, JUMP TO DEAL WITH 8-BIT FETCH/PULL
+                                                                                                   $STATE_ASSIGN$;              //  NO, JUMP TO ASSIGN VALUE_8 AND ADDR
+                }
+                case 3: {                                                                                                       // PULL OR 8-BIT FETCH
+                    out_wrappage = MCODE.i_actions[1,1];                                                                        //  WRAP IF PULL FROM STACK
+                    out_address = MCODE.i_actions[1,1] ? { 1b1, SPp1 } :                                                        //  PULL?
+                                                         ( MCODE.i_indirect ? in_data[0,16] : MCODE.i_ea ) + MCODE.i_ea_offset; //  INDIRECT?
+                    req_read = 1;
+                    STATE = $STATE_ASSIGN$;
+                }
+                case 4: {                                                                                                       // ASSIGN ADDR, VALUE_8
+                    VALUE_8 = MCODE.i_actions[1,1] | ( MCODE.i_actions[0,1] & ~MCODE.i_immediate ) ? in_data[0,8] :
+                                                                                                     MCODE.value_8;
+                    ADDR = ( MCODE.i_indirect ? in_data[0,16] : MCODE.i_ea ) + MCODE.i_ea_offset;
+                    STATE = mem_busy ? $STATE_ASSIGN$ : $STATE_EXECUTE$;
+                }
+                case 5: {                                                                                                       // EXECUTE MICROCODE
+                    RESULT = MCODE.i_immediate ? MCODE.value_8 : VALUE_8;                                                       // SET DEFAULT RESULT
+                    switch( MCODE.i_mcode[4,4] ) {
+                        case 4h0: {                                                                                             // ARITHMETIC
+                            switch( MCODE.i_mcode[0,4] ) {
+                                case 4h1: { RESULT = ADD.RESULT; SR.mask = 8b11000011; SR.flags = ADD.SR; }                     //  ADC
+                                case 4h2: { RESULT = SUB.RESULT; SR.mask = 8b11000011; SR.flags = SUB.SR; }                     //  SBC
+                                case 4h3: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                     //  AND, SET NZ FLAGS
+                                case 4h4: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                     //  EOR, SET NZ FLAGS
+                                case 4h5: { RESULT = AOX.RESULT; SR.mask = 8b10000010; SR.flags = AOX.SR; }                     //  OR, SET NZ FLAGS
+                                case 4h6: { RESULT = ASL.RESULT; SR.mask = 8b10000011; SR.flags = ASL.SR; }                     //  ASL, SET NZC FLAGS
+                                case 4h7: { RESULT = LSR.RESULT; SR.mask = 8b10000011; SR.flags = LSR.SR; }                     //  LSR, SET NZC FLAGS
+                                case 4h8: { RESULT = ROL.RESULT; SR.mask = 8b10000011; SR.flags = ROL.SR; }                     //  ROL, SET NZC FLAGS
+                                case 4h9: { RESULT = ROR.RESULT; SR.mask = 8b10000011; SR.flags = ROR.SR; }                     //  ROR,SET NZC FLAGS
+                                case 4ha: {                                                                                     //  BIT
+                                    SR.mask = MCODE.i_immediate ? 8b00000010 : 8b11000010;                                      //      ( 65c02 ) IMM MODE ONLY AFFECTS Z FLAG
+                                    SR.flags = { VALUE_8[6,2], 4b0000, ~|( VALUE_8 & REGS[0] ), 1b0 };                          //      SET N = bit 7, V = bit 6, AND Z FLAGS
+                                }
+                                default: {}                                                                                     // UNDEFINED, TREAT AS NOP
                             }
-                            default: {}                                                                                         // UNDEFINED, TREAT AS NOP
                         }
-                    }
-                    case 4h1: { JUMPBRANCH = ( SR.SR[ MCODE.i_mcode[0,3], 1 ] == MCODE.i_mcode[3,1] ); }                        // BRANCH, TEST FLAG[ MCODE.i_mcode[0,3] ] == OPCDOE[3,1]
-                    case 4h2: { SR.mask = CLSEMASK; SR.flags = CLSEVALUE; }                                                     // SET FLAG[ MCODE.i_mcode[3,1] ] TO MCODE.i_mcode[3,1]
-                    case 4h3: { SR.mask = 8b10000011; SR.flags = SUB.SR; }                                                      // COMPARE, USE SUBTRACT, IGNORE OVERFLOW FLAG
-                    case 4h4: {
-                        if( MCODE.i_mcode[3,1] ) { RESULT = INC; } else { RESULT = DEC; }                                       // INC/DEC MEMORY, A, X OR Y
-                        SR.mask = 8b10000010; SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };                          //  SET NZ FLAGS
-                        REGISTER = MCODE.i_mcode[0,2];                                                                          //  SET DESTINATION REGISTER
-                    }
-                    case 4h5: {                                                                                                 // JMP JSR RTS RTI
-                        if( MCODE.i_mcode[3,1] ) {                                                                              // RTI RTS
-                            if( MCODE.i_mcode[0,1] ) {
-                                SR.mask = 8b11111111; SR.flags = VALUE_8; ADDR = in_data[8,16];                                 //  RTI FETCH STATUS REGISTER AND RETURN ADDRESS
-                                RESULT = SPp3;                                                                                  //   UPDATE STACK
+                        case 4h1: { JUMPBRANCH = ( SR.SR[ MCODE.i_mcode[0,3], 1 ] == MCODE.i_mcode[3,1] ); }                    // BRANCH, TEST FLAG[ MCODE.i_mcode[0,3] ] == OPCDOE[3,1]
+                        case 4h2: { SR.mask = CLSEMASK; SR.flags = CLSEVALUE; }                                                 // SET FLAG[ MCODE.i_mcode[3,1] ] TO MCODE.i_mcode[3,1]
+                        case 4h3: { SR.mask = 8b10000011; SR.flags = SUB.SR; }                                                  // COMPARE, USE SUBTRACT, IGNORE OVERFLOW FLAG
+                        case 4h4: {
+                            if( MCODE.i_mcode[3,1] ) { RESULT = INC; } else { RESULT = DEC; }                                   // INC/DEC MEMORY, A, X OR Y
+                            SR.mask = 8b10000010; SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };                      //  SET NZ FLAGS
+                            REGISTER = MCODE.i_mcode[0,2];                                                                      //  SET DESTINATION REGISTER
+                        }
+                        case 4h5: {                                                                                             // JMP JSR RTS RTI
+                            if( MCODE.i_mcode[3,1] ) {                                                                          // RTI RTS
+                                if( MCODE.i_mcode[0,1] ) {
+                                    SR.mask = 8b11111111; SR.flags = VALUE_8; ADDR = in_data[8,16];                             //  RTI FETCH STATUS REGISTER AND RETURN ADDRESS
+                                    RESULT = SPp3;                                                                              //   UPDATE STACK
+                                } else {
+                                    ADDR = PCrts; RESULT = SPp2;                                                                //  RTS FETCH RETURN ADDRESS AND +1, UPDATE STACK
+                                }
                             } else {
-                                ADDR = PCrts; RESULT = SPp2;                                                                    //  RTS FETCH RETURN ADDRESS AND +1, UPDATE STACK
+                                if( MCODE.i_mcode[0,1] ) {
+                                    out_address = { 1b1, SPm1 }; req_mask = 2b11; out_data = PCjsr;                             //  JSR, WRITE PC+2 TO STACK
+                                    RESULT = SPm2; out_wrappage = 1; req_write = 1;
+                                }
                             }
-                        } else {
-                            if( MCODE.i_mcode[0,1] ) {
-                                out_address = { 1b1, SPm1 }; req_mask = 2b11; out_data = PCjsr;                                 //  JSR, WRITE PC+2 TO STACK
-                                RESULT = SPm2; out_wrappage = 1; req_write = 1;
+                            REGISTER = 3; JUMPBRANCH = 1;
+                        }
+                        case 4h6: {                                                                                             // LDx STx
+                            if( MCODE.i_mcode[3,1] ) { RESULT = &MCODE.i_mcode[0,3] ? 0 : REGS[ MCODE.i_mcode[0,2] ]; }         //  STZ STA STX STY ( LDx ALREADY ASSIGNED TO VALUE_8 )
+                            REGISTER = MCODE.i_mcode[0,2];
+                            SR.mask = 8b10000010; SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };
+                        }
+                        case 4h7: {                                                                                             // ACCUMULATOR SHIFTS/ROTATES
+                            SR.mask = 8b10000011;                                                                               // SET FLAGS MASK, NZC
+                            switch( MCODE.i_mcode[0,2] ) {
+                                case 0: { RESULT = ASL.RESULT; SR.flags = ASL.SR; }                                             //  ASL
+                                case 1: { RESULT = LSR.RESULT; SR.flags = LSR.SR; }                                             //  LSR
+                                case 2: { RESULT = ROL.RESULT; SR.flags = ROL.SR; }                                             //  ROL
+                                case 3: { RESULT = ROR.RESULT; SR.flags = ROR.SR; }                                             //  ROR
                             }
                         }
-                        REGISTER = 3; JUMPBRANCH = 1;
-                    }
-                    case 4h6: {                                                                                                 // LDx STx
-                        if( MCODE.i_mcode[3,1] ) { RESULT = &MCODE.i_mcode[0,3] ? 0 : REGS[ MCODE.i_mcode[0,2] ]; }             //  STZ STA STX STY ( LDx ALREADY ASSIGNED TO VALUE_8 )
-                        REGISTER = MCODE.i_mcode[0,2];
-                        SR.mask = 8b10000010; SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };
-                    }
-                    case 4h7: {                                                                                                 // ACCUMULATOR SHIFTS/ROTATES
-                        SR.mask = 8b10000011;                                                                                   // SET FLAGS MASK, NZC
-                        switch( MCODE.i_mcode[0,2] ) {
-                            case 0: { RESULT = ASL.RESULT; SR.flags = ASL.SR; }                                                 //  ASL
-                            case 1: { RESULT = LSR.RESULT; SR.flags = LSR.SR; }                                                 //  LSR
-                            case 2: { RESULT = ROL.RESULT; SR.flags = ROL.SR; }                                                 //  ROL
-                            case 3: { RESULT = ROR.RESULT; SR.flags = ROR.SR; }                                                 //  ROR
-                        }
-                    }
-                    case 4h8: {                                                                                                 // PUSH / PULL
-                        if( MCODE.i_mcode[3,1] ) {                                                                              // PULL
-                            REGISTER = MCODE.i_mcode[0,2];                                                                      //  USE VALUE_8 FOR RESULT AND SET REGISTER DESTINATION
-                            SR.mask = MCODE.i_mcode[2,1] ? 8b11111111 : 8b10000010;                                             //  SET FLAGS MASK, ALL IF PLP
-                            SR.flags = MCODE.i_mcode[2,1] ? VALUE_8 : { VALUE_8[7,1], 5b00000, ~|VALUE_8[0,8], 1b0 };           //  SET FLAGS VALUE_8 IF PLP ELSE NZ FLAGS
-                            REGS[3] = SPp1;                                                                                     //  ADJUST STACK POINTER
-                        } else {
-                            out_address = { 1b1, REGS[3] }; req_mask = 2b01;                                                    // PUSH PREPARE WRITE TO STACK
-                            out_data = MCODE.i_mcode[2,1] ? SR.SR | 8b00010000 : REGS[ MCODE.i_mcode[0,2] ];                    //  FLAGS OR REGISTER VALUE
-                            REGS[3] = SPm1; out_wrappage = 1; req_write = 1;                                                    //  PREPARE WRITE
-                        }
-                    }
-                    case 4h9: {                                                                                                 // TRANSFER { 9, fftt } where ff FROM and tt TO
-                        RESULT = REGS[ MCODE.i_mcode[2,2] ];                                                                    //  ==0 A, ==1 X, ==2 Y, ==3 SP
-                        SR.mask = &MCODE.i_mcode[0,2] ? 8b00000000 : 8b10000010;                                                // TRANSFER TO SP NO FLAGS, OTHERWISE NZ FLAGS AFFECTED
-                        SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };                                                // SET N AND Z FLAGS
-                        REGISTER = MCODE.i_mcode[0,2];
-                    }
-                    case 4ha: {
-                        if( ~MCODE.i_mcode[0,1] ) {
-                            out_address = { 1b1, SPm2 }; out_data = { PCnext, SR.SR | 5b10000 };                                // BRK, WRITE { PCnext, SR inc B flag } TO STACK
-                            out_wrappage = 1; req_mask = 3b111; req_write = 1;                                                  //  START PUSH
-                            SR.mask = 8b00010100; SR.flags = 8b00010100; ADDR = VECTORS[2]; JUMPBRANCH = 1;                     //  JUMP TO IRQ VECTOR NOTE: CHECK I SET TO  DISABLED
-                        }
-                        RESULT = SPm3; REGISTER = 3;                                                                            // UPDATE STACK, IGNORED BY NOP
-                    }
-                    case 4hb: {
-                        switch( MCODE.i_mcode[0,2] ) {
-                            default: {                                                                                          // TRB TSB
-                                RESULT = MCODE.i_mcode[3,1] ? ( VALUE_8 | REGS[0] ): ( VALUE_8 & ~REGS[0] );                    //      RESET/SET BITS AS MASKED BY ACCUMULATOR
-                                SR.mask = 8b00000010; SR.flags = { 6b00000, ~|( VALUE_8 & REGS[0] ), 1b0 };                     //      Z IF VALUE_8 & A == 0
+                        case 4h8: {                                                                                             // PUSH / PULL
+                            if( MCODE.i_mcode[3,1] ) {                                                                          // PULL
+                                REGISTER = MCODE.i_mcode[0,2];                                                                  //  USE VALUE_8 FOR RESULT AND SET REGISTER DESTINATION
+                                SR.mask = MCODE.i_mcode[2,1] ? 8b11111111 : 8b10000010;                                         //  SET FLAGS MASK, ALL IF PLP
+                                SR.flags = MCODE.i_mcode[2,1] ? VALUE_8 : { VALUE_8[7,1], 5b00000, ~|VALUE_8[0,8], 1b0 };       //  SET FLAGS VALUE_8 IF PLP ELSE NZ FLAGS
+                                REGS[3] = SPp1;                                                                                 //  ADJUST STACK POINTER
+                            } else {
+                                out_address = { 1b1, REGS[3] }; req_mask = 2b01;                                                // PUSH PREPARE WRITE TO STACK
+                                out_data = MCODE.i_mcode[2,1] ? SR.SR | 8b00010000 : REGS[ MCODE.i_mcode[0,2] ];                //  FLAGS OR REGISTER VALUE
+                                REGS[3] = SPm1; out_wrappage = 1; req_write = 1;                                                //  PREPARE WRITE
                             }
-                            case 2b01: {                                                                                        // BBRx BBSx
-                                JUMPBRANCH = ( VALUE_8[ MCODE.i_6502_high[0,3], 1 ] == MCODE.i_mcode[3,1] );                    //      BRANCH IF BIT 0 (R) OR (1) S
-                                ADDR = PCbrx;                                                                                   //      RELATIVE BRANCH
-                            }
-                            case 2b10: { RESULT[ MCODE.i_6502_high[0,3], 1 ] = MCODE.i_mcode[3,1]; }                            // RMBx SMBx, CLEAR / SET BIT
                         }
+                        case 4h9: {                                                                                             // TRANSFER { 9, fftt } where ff FROM and tt TO
+                            RESULT = REGS[ MCODE.i_mcode[2,2] ];                                                                //  ==0 A, ==1 X, ==2 Y, ==3 SP
+                            SR.mask = &MCODE.i_mcode[0,2] ? 8b00000000 : 8b10000010;                                            // TRANSFER TO SP NO FLAGS, OTHERWISE NZ FLAGS AFFECTED
+                            SR.flags = { RESULT[7,1], 5b00000, ~|RESULT[0,8], 1b0 };                                            // SET N AND Z FLAGS
+                            REGISTER = MCODE.i_mcode[0,2];
+                        }
+                        case 4ha: {
+                            if( ~MCODE.i_mcode[0,1] ) {
+                                out_address = { 1b1, SPm2 }; out_data = { PCnext, SR.SR | 5b10000 };                            // BRK, WRITE { PCnext, SR inc B flag } TO STACK
+                                out_wrappage = 1; req_mask = 3b111; req_write = 1;                                              //  START PUSH
+                                SR.mask = 8b00010100; SR.flags = 8b00010100; ADDR = VECTORS[2]; JUMPBRANCH = 1;                 //  JUMP TO IRQ VECTOR NOTE: CHECK I SET TO  DISABLED
+                            }
+                            RESULT = SPm3; REGISTER = 3;                                                                        // UPDATE STACK, IGNORED BY NOP
+                        }
+                        case 4hb: {
+                            switch( MCODE.i_mcode[0,2] ) {
+                                default: {                                                                                      // TRB TSB
+                                    RESULT = MCODE.i_mcode[3,1] ? ( VALUE_8 | REGS[0] ): ( VALUE_8 & ~REGS[0] );                //      RESET/SET BITS AS MASKED BY ACCUMULATOR
+                                    SR.mask = 8b00000010; SR.flags = { 6b00000, ~|( VALUE_8 & REGS[0] ), 1b0 };                 //      Z IF VALUE_8 & A == 0
+                                }
+                                case 2b01: {                                                                                    // BBRx BBSx
+                                    JUMPBRANCH = ( VALUE_8[ MCODE.i_6502_high[0,3], 1 ] == MCODE.i_mcode[3,1] );                //      BRANCH IF BIT 0 (R) OR (1) S
+                                    ADDR = PCbrx;                                                                               //      RELATIVE BRANCH
+                                }
+                                case 2b10: { RESULT[ MCODE.i_6502_high[0,3], 1 ] = MCODE.i_mcode[3,1]; }                        // RMBx SMBx, CLEAR / SET BIT
+                            }
+                        }
+                        default: {}                                                                                             // UNDEFINED
                     }
-                    default: {}                                                                                                 // UNDEFINED
+                    STATE = MCODE.i_actions[3,1] ? $STATE_WRITE_8$ : $STATE_COMMIT$;
                 }
-
-                if( MCODE.i_actions[3,1] ) {                                                                                    // WRITE 8 BIT VALUE_8 TO MEMORY
+                case 6: {                                                                                                       // WRITE 8 BIT VALUE_8 TO MEMORY
                     out_wrappage = MCODE.i_zp_wrap; out_address = ADDR; req_mask = 2b01; out_data = RESULT; req_write = 1;
+                    STATE = $STATE_COMMIT$;
                 }
-
-                if( MCODE.i_actions[5,1] ) { REGS[ REGISTER ] = RESULT[0,8]; }                                                  // COMMIT TO REGISTER
-                SR.update = MCODE.i_actions[6,1];                                                                               // UPDATE SR
-
-                while( mem_busy ) {}                                                                                            // WAIT FOR STORE/PUSH TO FINISH
-
-                if( IRQ ) {
-                    out_address = { 1b1, SPm2 }; out_data = { JUMPBRANCH ? ADDR : PCnext, { SR.SR[5,3], 1b0, SR.SR[0,4] } };    // IRQ, WRITE { PCnext, SR } TO STACK
+                case 7: {                                                                                                       // COMMIT TO REGISTERS, UPDATE STATUS FLAGS
+                    if( MCODE.i_actions[5,1] ) { REGS[ REGISTER ] = RESULT[0,8]; }                                              // COMMIT TO REGISTER
+                    SR.update = MCODE.i_actions[6,1];                                                                           // UPDATE SR
+                    STATE = IRQ ? $STATE_IRQ_REQ$ : $STATE_NEXT_ISN$;
+                }
+                case 8: {                                                                                                       // IRQ REQUESTED
+                    out_address = { 1b1, SPm2 }; out_data = { JUMPBRANCH ? ADDR : PCnext, { SR.SR[5,3], 1b0, SR.SR[0,4] } };    //  WRITE { PCnext, SR } TO STACK
                     out_wrappage = 1; req_mask = 3b111; req_write = 1;
-                    SR.mask = 8b00010100; SR.flags = 8b00000100; SR.update = 1; while( mem_busy ) {}                            //  START PUSH, UPDATE STATUS TO SEI
-                    ADDR = VECTORS[2]; JUMPBRANCH = 1;                                                                          //  JUMP TO IRQ VECTOR NOTE
+                    SR.mask = 8b00011100; SR.flags = 8b00000100; SR.update = 1;                                                 // SET STATUS FLAGS TO SHOW IRQ NOT BRK, CLEAR DECIMAL
+                    ADDR = VECTORS[2]; JUMPBRANCH = 1;                                                                          // JUMP TO IRQ VECTOR
                     REGS[3] = SPm3;                                                                                             // UPDATE STACK
-                    __display("IRQ");
+                    STATE = $STATE_NEXT_ISN$;
                 }
-
-                out_wrappage = 0; out_address = JUMPBRANCH ? ADDR : PCnext; PC = JUMPBRANCH ? ADDR : PCnext; req_read = 1;      // FETCH NEXT INSTRUCTION
+                case 9: {                                                                                                       // NEXT INSTRUCTION
+                    out_wrappage = 0; out_address = JUMPBRANCH ? ADDR : PCnext; PC = JUMPBRANCH ? ADDR : PCnext; req_read = 1;  //  START FETCH
+                    STATE = $STATE_FETCH$;
+                }
             }
         }
     }

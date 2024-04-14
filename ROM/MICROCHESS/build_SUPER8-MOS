@@ -1,0 +1,6 @@
+ca65 --cpu 65c02 -l SUPER8-MOS.list SUPER8-MOS.s
+ld65 -C SUPER8-MOS.cfg -o SUPER8-MOS.bin SUPER8-MOS.o
+
+ca65 --cpu 65c02 -l microchess.list -o CHESS.o microchess.s
+ld65 -C CHESS.cfg -o CHESS.bin CHESS.o
+
