@@ -9,7 +9,7 @@ unit multiplex_display(
 
     input   uint8   terminal_pixel,                                                                                                // CHARACTER MAP PIXEL
     input   uint1   terminal_display,                                                                                          //               DISPLAY?
-) <reginputs> {
+) {
     selectlayer mpd(
         V <: V,
         background_pixel <: background_pixel,
@@ -33,6 +33,6 @@ unit selectlayer(
     input   uint8   terminal_pixel,
     input   uint8   background_pixel,
     output! uint8   pixel
-) <reginputs> {
+) {
     pixel := ( V & terminal_display ) ? terminal_pixel : background_pixel;
 }

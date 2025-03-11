@@ -11,7 +11,7 @@ unit memory_main(
     output  uint1   TERMINAL_req_write,
     output  uint1   TERMINAL_req_read,
     input   uint8   TERMINAL_in_data
-) <reginputs> {
+) {
     $$config['dualport_bram_wmask_byte_wenable0_width'] = 'data'
     $$config['dualport_bram_wmask_byte_wenable1_width'] = 'data'
     dualport_bram uint16 ram <"dualport_bram_wmask_byte"> [16384] = uninitialized;                                                // RAM, 0000 - 7fff

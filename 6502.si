@@ -15,7 +15,7 @@ unit CPU6502(
     input   uint1   RUN,
     input   uint1   RESET,
     input   uint1   DEBUG
-) <reginputs> {
+) {
     uint1   IRQ <:: TIMER_irq & ~SR.SR[2,1];                                                                                    // IRQ REQUEST AND IRQ ENABLED
 
     uint16  PC = uninitialised;                                                                                                 // PC
@@ -294,7 +294,7 @@ unit sr_6502(
     input   uint8   mask,
     input   uint8   flags,
     input   uint1   update
-) <reginputs> {
+) {
     C := SR[0,1];
 
     algorithm <autorun> { while(1) {
@@ -333,7 +333,7 @@ unit microcode_6502(
     output  uint16  value_16,
     output  uint16  i_ea,
     output  uint8   i_ea_offset,
-) <reginputs> {
+) {
     // { change status, commit, push, store 8, multi-cycle, pop, fetch 8 }
     brom uint7 mcode_actions[] = {
 //                 01 ADC     02 SBC     03 AND     04 EOR     05 ORA     06 ASL     07 LSR     08 ROL     09 ROR     0A BIT
@@ -466,7 +466,7 @@ unit ea_6502(
     output  uint1   i_indirect,
     output  uint1   i_immediate,
     output  uint1   i_zp_wrap
-) <reginputs> {
+) {
     i_indirect := 0; i_immediate := 0; i_ea := value_8; i_ea_offset := 0; i_zp_wrap := 0;
 
     algorithm <autorun> {
@@ -506,7 +506,7 @@ unit add_6502(
     input   uint1   Dflag,
     output  uint8   RESULT,
     output  uint8   SR,
-) <reginputs> {
+) {
     uint9   TEMPadd <: A + VALUE_8 + Cflag;
     uint4   low = uninitialised;
     uint4   high = uninitialised;
@@ -539,7 +539,7 @@ unit sub_6502(
     input   uint1   Dflag,
     output  uint8   RESULT,
     output  uint8   SR
-) <reginputs> {
+) {
     uint9   TEMPsub <: { A[7,1], A } - { VALUE_8[7,1], VALUE_8 } - ( Cflag ? 0 : 1 );
     uint4   low = uninitialised;
     uint4   high = uninitialised;
@@ -568,7 +568,7 @@ unit aox_6502(
     input   uint8   VALUE_8,
     output  uint8   RESULT,
     output  uint8   SR
-) <reginputs> {
+) {
     algorithm <autorun> { while(1) {
         switch( OP ) {
             case 3: { RESULT = A & VALUE_8; }
@@ -582,7 +582,7 @@ unit asl_6502(
     input   uint8   VALUE_8,
     output  uint8   RESULT,
     output  uint8   SR
-) <reginputs> {
+) {
     RESULT := VALUE_8 << 1;                                                                                                     // ASL
     SR := { VALUE_8[6,1], 5b00000, ~|VALUE_8[0,7], VALUE_8[7,1] };                                                                // SET NZC FLAGS
 }
@@ -590,7 +590,7 @@ unit lsr_6502(
     input   uint8   VALUE_8,
     output  uint8   RESULT,
     output  uint8   SR
-) <reginputs> {
+) {
     RESULT := VALUE_8 >> 1;                                                                                            // LSR
     SR := { 6b000000, ~|VALUE_8[1,7], VALUE_8[0,1] };                                                                // SET NZC FLAGS
 }
@@ -599,7 +599,7 @@ unit rol_6502(
     input   uint1   C,
     output  uint8   RESULT,
     output  uint8   SR
-) <reginputs> {
+) {
     RESULT := ( VALUE_8 << 1 ) | C;                                                                                              // ROL
     SR := { VALUE_8[6,1], 5b00000, ~|VALUE_8[0,7] & ~C, VALUE_8[7,1] };                                                                // SET NZC FLAGS
 }
@@ -608,7 +608,7 @@ unit ror_6502(
     input   uint1   C,
     output  uint8   RESULT,
     output  uint8   SR
-) <reginputs> {
+) {
     RESULT := ( VALUE_8 >> 1 ) | { C, 7b0000000 };                                                                                              // ROR
     SR := { C, 5b00000, ~|VALUE_8[1,7] & ~C, VALUE_8[0,1] };                                                                // SET NZC FLAGS
 }

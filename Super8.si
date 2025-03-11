@@ -36,6 +36,8 @@ unit main(
     // USB PS/2
     input   uint1   us2_bd_dp,
     input   uint1   us2_bd_dn,
+    output uint1 usb_fpga_pu_dp,
+    output uint1 usb_fpga_pu_dn,
 
     // AUDIO
     output  uint4   audio_l,
