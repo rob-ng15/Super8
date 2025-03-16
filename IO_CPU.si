@@ -17,7 +17,7 @@ unit memory_io(
 
     output  uint1   PULSE_1Hz,
     output  uint1   PULSE_100Hz,
-) {
+)  {
     ps2_IN PS2_IN( us2_bd_dp <: us2_bd_dp, us2_bd_dn <: us2_bd_dn );                                                            // PS2 EVENT QUEUE, DECODED MY MOS
 
     uart_IN UART_IN( uart_rx <: uart_rx );                                                                                      // UART INPUT QUEUE
@@ -56,7 +56,7 @@ unit fifo8(
     input   uint1   req_write,
     output  uint8   out_data,
     input   uint8   in_data
-) {
+)  {
     simple_dualport_bram uint8 queue[256] = uninitialized;
     uint8   next_p1 <:: queue.addr0 + 1;
     uint8   top_p1 <:: queue.addr1 + 1;
@@ -83,7 +83,7 @@ unit uart_IN(
     output  uint1   out_available,
     output  uint8   in_data,
     input   uint1   req_read
-) {
+)  {
     uart_in ui; uart_receiver urecv( io <:> ui, uart_rx <: uart_rx );                                                           // CONNECT TO UART RECEIVE PINS
     fifo8 IN(                                                                                                                   // UART IN FIFO BUFFER
         CLEAR <: CLEAR,
@@ -101,7 +101,7 @@ unit uart_OUT(
     output  uint1   out_full,
     input   uint8   out_data,
     input   uint1   req_write
-) {
+)  {
     uart_out uo; uart_sender usend( io <:> uo, uart_tx :> uart_tx );                                                            // CONNECT TO UART TRANSMIT PINS
     fifo8 OUT(                                                                                                                  // UART OUT FIFO BUFFER
         CLEAR <: CLEAR,
@@ -120,7 +120,7 @@ unit ps2_IN(
     output  uint1   key_available,
     output  uint8   keycode,
     input   uint1   req_read
-) {
+)  {
     ps2 PS2( ps2clk_ext <: us2_bd_dp, ps2data_ext <: us2_bd_dn );
     fifo8 IN(                                                                                                                   // PS2 IN FIFO BUFFER
         CLEAR <: CLEAR,
@@ -136,7 +136,7 @@ unit ps2_IN(
 unit timer_pulse1hz(
     output  uint1   pulse1hz,
     input   uint1   resetCounter
-) {
+)  {
     algorithm <autorun> {
         uint26  counter50mhz = uninitialised;
         uint1   zero <:: ~|counter50mhz;
@@ -157,7 +157,7 @@ unit timer_pulse100hz(
     input   uint1   enable,
     input   uint1   acknowledge,
     output  uint1   pulse100hz,
-) {
+)  {
     algorithm <autorun> {
         uint18  counter50mhz = uninitialised;
         uint1   zero <:: ~|counter50mhz;

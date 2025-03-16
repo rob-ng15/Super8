@@ -15,7 +15,7 @@ unit memory_terminal(
     output  uint8   MAIN_out_data,
     input   uint1   MAIN_req_write,
     input   uint1   MAIN_req_read,
-) {
+)  {
     dualport_bram uint8 terminal_character <@CLOCK_VIDEO,@clock>[$32*24$] = uninitialised;                                      // 32 x 24 character buffer
     dualport_bram uint8 terminal_foreground <@CLOCK_VIDEO,@clock> [$32*24$] = uninitialised;                                    // 32 x 24 character buffer
     dualport_bram uint8 terminal_background <@CLOCK_VIDEO,@clock> [$32*24$] = uninitialised;                                    // 32 x 24 character buffer
@@ -162,7 +162,7 @@ unit characterrom512(
     input   uint1   double_right,
     input   uint1   double_bottom,
     output! uint1   pixel
-) {
+)  {
     brom uint8 characterGenerator8x8[4096] =  {
         $include('ROM/FONTS/CODE437-THINBOLD.inc')
         ,pad(uninitialized)
@@ -195,7 +195,7 @@ unit terminal(
     input   uint1   cursor_show,
     input   uint5   cursor_x,
     input   uint5   cursor_y
-) {
+)  {
     characterrom512 CGROM <@clockCG> (                                                                                          // Character ROM 8x8 512 characters, 256 normal, 256 bold
         PULSE_1Hz <: PULSE_1Hz,
         character <: terminal_character.rdata0,

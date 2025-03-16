@@ -11,20 +11,20 @@ unit memory_main(
     output  uint1   TERMINAL_req_write,
     output  uint1   TERMINAL_req_read,
     input   uint8   TERMINAL_in_data
-) {
+)  {
     $$config['dualport_bram_wmask_byte_wenable0_width'] = 'data'
     $$config['dualport_bram_wmask_byte_wenable1_width'] = 'data'
-    dualport_bram uint16 ram <"dualport_bram_wmask_byte"> [16384] = uninitialized;                                                // RAM, 0000 - 7fff
+    dualport_bram uint16 ram <"dualport_bram_wmask_byte"> [16384] = uninitialized;                                              // RAM, 0000 - 7fff
 
     dualport_bram uint16 MOS [2048] = {file("ROM/MAIN-6502/MOS.bin"), pad(uninitialized)};                                      // ROM MOS COMPAT LAYER F000 - ffff
-    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/MAIN-6502/BBC_BASIC4.bin"), pad(uninitialized)};                             // ROM BBC LANGUAGE 8000 - Bfff
+    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/MAIN-6502/BBC_BASIC4.bin"), pad(uninitialized)};                          // ROM BBC LANGUAGE 8000 - Bfff
 
-//    dualport_bram uint16 MOS [2048] = {file("ROM/SECND/SUPER8-MOS.bin"), pad(uninitialized)};                                      // ROM MOS COMPAT LAYER F000 - ffff
-//    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/SECND/SECND.bin"), pad(uninitialized)};                             // ROM SECND FORTH 8000 - Bfff
+//    dualport_bram uint16 MOS [2048] = {file("ROM/SECND/SUPER8-MOS.bin"), pad(uninitialized)};                                   // ROM MOS COMPAT LAYER F000 - ffff
+//    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/SECND/SECND.bin"), pad(uninitialized)};                                   // ROM SECND FORTH 8000 - Bfff
 
 //    dualport_bram uint16 ram <"dualport_bram_wmask_byte"> [16384] = {file("ROM/MAIN-6502/6502-TEST/TEST.bin"), pad(uninitialized)};  // RAM 6502-TEST-SUITE, 0000 - 7fff
 //    dualport_bram uint16 MOS [2048] = {file("ROM/MAIN-6502/6502-TEST/SUPER8-MOS.bin"), pad(uninitialized)};                          // ROM MOS COMPAT LAYER F000 - ffff
-//    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/SECND/SECND.bin"), pad(uninitialized)};                                            // ROM SECND FORTH 8000 - Bfff
+//    dualport_bram uint16 LANGUAGE [8192] = {file("ROM/SECND/SECND.bin"), pad(uninitialized)};                                        // ROM SECND FORTH 8000 - Bfff
 
     CPU6502 CPU(
         TIMER_irq <: TIMER_irq,

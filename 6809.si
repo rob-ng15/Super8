@@ -12,7 +12,7 @@ unit CPU6309(
 
     input   uint1   RUN,
     input   uint1   RESET
-) <reginputs> {
+)  {
 
     uint16  PC = uninitialised;                                                                                                 // PROGRAM COUNTER
     uint16  SP[2] = uninitialised;                                                                                              // STACK POINTERS user, system
@@ -44,7 +44,7 @@ unit CPU6309(
 
 // CONVERT 6309 OPCODES INTO MICROCODES + ADDRESS MODE + ACTION FLAGS, CALCULATE BASE EFFECTIVE ADDRESS ( INDIRECT WILL REQUIRE A READ FROM THIS EA )
 unit microcode_6309(
-) <reginputs> {
+)  {
     // ADDRESS MODES
     //  00
     //  01  IMMEDIATE   #
